@@ -25,6 +25,7 @@ jobs:
         with:
           version: "0.5.11"
           enable-cache: true
+          cache-suffix: ruff
       - name: Check lint and formatting
         run: |
           uv run --locked --only-dev ruff check .
@@ -40,5 +41,6 @@ jobs:
         with:
           version: "0.5.11"
           enable-cache: true
+          cache-suffix: ty
       - name: Check types
         run: uv run --locked ty check
