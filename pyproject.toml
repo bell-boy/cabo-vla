@@ -1,10 +1,31 @@
 [project]
-name = "cabo-vla"
+name = "cabo_vla"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "jax>=0.11.2",
+    "jaxtyping>=0.3.11",
     "lerobot>=0.6.1",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 88
+src = ["python"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+# Jaxtyping shape strings are not Python forward references.
+"python/cabo_vla/data/dataloader.py" = ["F722"]
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.2",
+    "pytest>=9.1.1",
+    "ruff>=0.16.10",
+    "ty>=0.0.85",
 ]
