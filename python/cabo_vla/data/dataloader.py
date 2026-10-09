@@ -12,3 +12,4 @@ class Batch:
     instruction: str
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
+    timestamp: Float[jax.Array, "Batch"]

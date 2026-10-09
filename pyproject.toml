@@ -12,11 +12,13 @@ dependencies = [
 
 [tool.ruff]
 target-version = "py312"
-line-length = 88
+line-length = 160
 src = ["python"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I"]
+# Jaxtyping shape strings are not Python forward references.
+ignore = ["F722"]
 
 [tool.ruff.lint.per-file-ignores]
 # Jaxtyping shape strings are not Python forward references.
