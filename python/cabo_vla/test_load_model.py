@@ -1,14 +1,13 @@
 import os
 
+import jax
 import jax.numpy as jnp
 from flax import nnx
-import jax
 
-from cabo_vla.config import ViTConfig
-from cabo_vla.config import VLAConfig
-from cabo_vla.pi0 import VLA
+from cabo_vla.config import ViTConfig, VLAConfig
 from cabo_vla.load_model import load_hf_vit
-from cabo_vla.vit import ViT
+from cabo_vla.models.pi0 import VLA
+from cabo_vla.models.vit import ViT
 
 jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax"))
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)

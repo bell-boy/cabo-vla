@@ -6,7 +6,7 @@ from jaxtyping import Float
 
 from cabo_vla.config import VLAConfig
 from cabo_vla.data.dataloader import Batch
-from cabo_vla.vit import ViT
+from cabo_vla.models.vit import ViT
 
 
 class VLABlock(nnx.Module):
