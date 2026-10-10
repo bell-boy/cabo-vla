@@ -55,7 +55,7 @@ class VLA(nnx.Module):
         vit_tokens = self.ViT(imgs)  # (b*c1, n, d)
         vit_tokens = rearrange(vit_tokens, "(b c1) n d-> b (c1 n) d", c1=CA)
         state = self.state_proj(state)
-        x = jnp.concatenate([vit_tokens, state], axis=1)
+        x = jnp.concatenate([vit_tokens, jnp.expand_dims(state, axis=1)], axis=1)
 
         cache = []
         mask = None  #  unused for now, but when we start using pretrained siglip weights, we'll want to prevent the vla from attending to the state tokens (pi 0 style), or if we go pi 0.5 style with fast in the prompt, then we'll need to think more about how we want to structure the mask
@@ -64,6 +64,7 @@ class VLA(nnx.Module):
             cache.append(kv)
         return x, cache
 
+    
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: int):
         x = self.action_in(action_t)  # + self.embed_time(traj_time)
         for block, kv_cache in zip(self.action_blocks, cache):
