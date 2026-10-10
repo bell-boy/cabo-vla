@@ -5,19 +5,19 @@ from einops import rearrange
 from jaxtyping import Float
 
 from cabo_vla.config import VLAConfig
-from cabo_vla.data.dataloader import Batch
 from cabo_vla.models.vit import ViT
 
 
 class VLABlock(nnx.Module):
-    def __init__(self, dim: int, heads: int, mlp_dim: int, *, rngs: nnx.Rngs):
+    def __init__(self, dim: int, heads: int, head_dim: int, mlp_dim: int, *, rngs: nnx.Rngs):
         self.heads = heads
         self.ln1 = nnx.LayerNorm(dim, epsilon=1e-12, rngs=rngs)
         self.ln2 = nnx.LayerNorm(dim, epsilon=1e-12, rngs=rngs)
-        self.q = nnx.Linear(dim, dim, rngs=rngs)
-        self.k = nnx.Linear(dim, dim, rngs=rngs)
-        self.v = nnx.Linear(dim, dim, rngs=rngs)
-        self.o = nnx.Linear(dim, dim, rngs=rngs)
+        inner = heads * head_dim  # head_dim is shared by the vlm and action blocks so the action blocks can attend to the vlm kv cache
+        self.q = nnx.Linear(dim, inner, rngs=rngs)
+        self.k = nnx.Linear(dim, inner, rngs=rngs)
+        self.v = nnx.Linear(dim, inner, rngs=rngs)
+        self.o = nnx.Linear(inner, dim, rngs=rngs)
         self.fc1 = nnx.Linear(dim, mlp_dim, rngs=rngs)
         self.fc2 = nnx.Linear(mlp_dim, dim, rngs=rngs)
 
@@ -39,20 +39,21 @@ class VLABlock(nnx.Module):
 class VLA(nnx.Module):
     def __init__(self, cfg: VLAConfig, *, rngs: nnx.Rngs):
         self.cfg = cfg
-        self.ViT = ViT(cfg.vit, rngs=rngs)
-        self.vlm_blocks = nnx.List([VLABlock(cfg.vlm_dim, cfg.heads, cfg.vlm_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
-        self.action_blocks = nnx.List([VLABlock(cfg.action_dim, cfg.heads, cfg.action_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
+        self.ViT = ViT(cfg.vit, cls_out_params=None, rngs=rngs)
+        self.img_proj = nnx.Linear(cfg.vit.dim, cfg.vlm_dim, rngs=rngs)
+        self.vlm_blocks = nnx.List([VLABlock(cfg.vlm_dim, cfg.heads, cfg.head_dim, cfg.vlm_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
+        self.action_blocks = nnx.List([VLABlock(cfg.action_dim, cfg.heads, cfg.head_dim, cfg.action_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
         self.state_proj = nnx.Linear(cfg.state_size, cfg.vlm_dim, rngs=rngs)
         self.action_in = nnx.Linear(cfg.action_size, cfg.action_dim, rngs=rngs)
         self.action_out = nnx.Linear(cfg.action_dim, cfg.action_size, rngs=rngs)
 
     def encode_state_imgs(
-        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch Horizon Action"], time: Float[jax.Array, "Batch"]
+        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch State"], time: Float[jax.Array, " Batch"]
     ):  # pi 0 style state
         # the attention mask is structured in a way to allow for caching the encoding of the state/img prefix and reuse the same intermediate tokens for the action decoding
         B, CA, C, H, W = imgs.shape
         imgs = rearrange(imgs, "b c1 c2 h w -> (b c1) c2 h w")  # combine batch and camera dimensions
-        vit_tokens = self.ViT(imgs)  # (b*c1, n, d)
+        vit_tokens = self.img_proj(self.ViT(imgs))  # (b*c1, n, vlm_dim)
         vit_tokens = rearrange(vit_tokens, "(b c1) n d-> b (c1 n) d", c1=CA)
         state = self.state_proj(state)
         x = jnp.concatenate([vit_tokens, jnp.expand_dims(state, axis=1)], axis=1)
@@ -65,7 +66,7 @@ class VLA(nnx.Module):
         return x, cache
 
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: int):
-        x = self.action_in(action_t)  # + self.embed_time(traj_time)
+        x = self.action_in(action_t)  # TODO: add self.embed_time(traj_time)
         for block, kv_cache in zip(self.action_blocks, cache):
             x, _ = block(x, kv_cache)
         return self.action_out(x)

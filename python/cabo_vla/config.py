@@ -16,6 +16,7 @@ class VLAConfig:
     vit: ViTConfig = field(default_factory=ViTConfig)
     layers: int = 12
     heads: int = 12
+    head_dim: int = 64
     vlm_dim: int = 768
     vlm_mlp_dim: int = 3072
     action_dim: int = 768
