@@ -29,7 +29,7 @@ class ViTBlock(nnx.Module):
 
 
 class ViT(nnx.Module):
-    def __init__(self, cfg: ViTConfig, cls_out_params: int = 1000, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: ViTConfig, cls_out_params: int | None = 1000, *, rngs: nnx.Rngs):
         self.cfg = cfg
         self.blocks = nnx.List([ViTBlock(cfg.dim, cfg.heads, cfg.mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
         self.patch_embed = nnx.Conv(
@@ -42,7 +42,8 @@ class ViT(nnx.Module):
         self.cls_token = nnx.Param(jnp.zeros((1, 1, cfg.dim)))  # might be able to remove with model surgery, or maybe not
         self.pos_embed = nnx.Param(jnp.zeros((1, (cfg.input_size // cfg.patch_size) ** 2 + 1, cfg.dim)))  # with base config should be 1, 197, 768
         self.out_norm = nnx.LayerNorm(cfg.dim, epsilon=1e-12, rngs=rngs)
-        self.projector_mlp = nnx.Linear(in_features=cfg.dim, out_features=cls_out_params, rngs=rngs)
+        # imagenet classifier head, only needed to check the hf port; pass cls_out_params=None to skip it
+        self.projector_mlp = nnx.Linear(in_features=cfg.dim, out_features=cls_out_params, rngs=rngs) if cls_out_params is not None else None
 
     def __call__(self, x: Float[jax.Array, "Batch Channel Height Width"]):
         B = x.shape[0]
