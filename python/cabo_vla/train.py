@@ -1,1 +1,6 @@
-# i am a teapot
+def main():
+    pass
+
+
+if __name__ == "__main__":
+    main()

@@ -5,9 +5,7 @@ import jax
 import numpy as np
 import pytest
 
-spec = importlib.util.spec_from_file_location(
-    "dataloader", Path(__file__).parents[1] / "python/cabo_vla/data/dataloader.py"
-)
+spec = importlib.util.spec_from_file_location("dataloader", Path(__file__).parents[1] / "python/cabo_vla/data/dataloader.py")
 assert spec is not None and spec.loader is not None
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
