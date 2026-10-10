@@ -60,7 +60,7 @@ class VLA(nnx.Module):
         cache = []
         mask = None  #  unused for now, but when we start using pretrained siglip weights, we'll want to prevent the vla from attending to the state tokens (pi 0 style), or if we go pi 0.5 style with fast in the prompt, then we'll need to think more about how we want to structure the mask
         for block in self.vlm_blocks:
-            x, kv = block(x, mask = mask)
+            x, kv = block(x, mask=mask)
             cache.append(kv)
         return x, cache
 

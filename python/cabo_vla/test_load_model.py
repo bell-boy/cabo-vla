@@ -1,9 +1,10 @@
-from flax import nnx
 import jax.numpy as jnp
+from flax import nnx
 
+from cabo_vla.config import ViTConfig
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.vit import ViT
-from cabo_vla.config import ViTConfig
+
 
 def main():
     vit_config = ViTConfig()
@@ -12,7 +13,8 @@ def main():
     sample_input = jnp.ones((16, 3, vit_config.input_size, vit_config.input_size))
     print(f"Sample input shape: {sample_input.shape}")
     output = vit(sample_input)
-    print(f"Output shape: {output.shape}") 
+    print(f"Output shape: {output.shape}")
+
 
 if __name__ == "__main__":
     main()

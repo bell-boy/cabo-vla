@@ -10,9 +10,7 @@ def load_hf_vit(model, repo="google/vit-base-patch16-224"):
     def put(var, arr, key):
         if var[...].shape != arr.shape:
             raise RuntimeError(
-                f"Shape mismatch loading '{key}' from {repo}: "
-                f"model expects {var[...].shape}, checkpoint has {arr.shape} "
-                "(after layout conversion)."
+                f"Shape mismatch loading '{key}' from {repo}: model expects {var[...].shape}, checkpoint has {arr.shape} (after layout conversion)."
             )
         var[...] = jnp.asarray(arr)
 
