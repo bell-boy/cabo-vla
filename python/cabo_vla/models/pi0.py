@@ -64,7 +64,6 @@ class VLA(nnx.Module):
             cache.append(kv)
         return x, cache
 
-    
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: int):
         x = self.action_in(action_t)  # + self.embed_time(traj_time)
         for block, kv_cache in zip(self.action_blocks, cache):
