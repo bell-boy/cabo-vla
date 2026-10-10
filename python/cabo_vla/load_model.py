@@ -7,23 +7,34 @@ def load_hf_vit(model, repo="google/vit-base-patch16-224"):
     # dict of name -> numpy array, e.g. "vit.encoder.layer.0.attention.attention.query.weight"
     sd = load_file(hf_hub_download(repo, "model.safetensors"))
 
-    def put(var, arr):
-        assert var[...].shape == arr.shape, (var[...].shape, arr.shape)
+    def put(var, arr, key):
+        if var[...].shape != arr.shape:
+            raise RuntimeError(
+                f"Shape mismatch loading '{key}' from {repo}: "
+                f"model expects {var[...].shape}, checkpoint has {arr.shape} "
+                "(after layout conversion)."
+            )
         var[...] = jnp.asarray(arr)
 
     def linear(mod, name):
-        put(mod.kernel, sd[f"{name}.weight"].T)  # torch [out, in] -> flax [in, out]
-        put(mod.bias, sd[f"{name}.bias"])
+        put(mod.kernel, sd[f"{name}.weight"].T, f"{name}.weight")  # torch [out, in] -> flax [in, out]
+        put(mod.bias, sd[f"{name}.bias"], f"{name}.bias")
 
     def norm(mod, name):
-        put(mod.scale, sd[f"{name}.weight"])
-        put(mod.bias, sd[f"{name}.bias"])
+        put(mod.scale, sd[f"{name}.weight"], f"{name}.weight")
+        put(mod.bias, sd[f"{name}.bias"], f"{name}.bias")
 
     e = "vit.embeddings"
-    put(model.patch_embed.kernel, sd[f"{e}.patch_embeddings.projection.weight"].transpose(2, 3, 1, 0))
-    put(model.patch_embed.bias, sd[f"{e}.patch_embeddings.projection.bias"])
-    put(model.cls_token, sd[f"{e}.cls_token"])
-    put(model.pos_embed, sd[f"{e}.position_embeddings"])
+
+    def emb(var, name, perm=None):
+        key = f"{e}.{name}"
+        arr = sd[key] if perm is None else sd[key].transpose(perm)
+        put(var, arr, key)
+
+    emb(model.patch_embed.kernel, "patch_embeddings.projection.weight", (2, 3, 1, 0))
+    emb(model.patch_embed.bias, "patch_embeddings.projection.bias")
+    emb(model.cls_token, "cls_token")
+    emb(model.pos_embed, "position_embeddings")
 
     # transformer blocks
     for i, blk in enumerate(model.blocks):
@@ -40,5 +51,5 @@ def load_hf_vit(model, repo="google/vit-base-patch16-224"):
     norm(model.out_norm, "vit.layernorm")
 
     # classifier is optional (skip it for the VLA)
-    if model.head is not None:
-        linear(model.head, "classifier")
+    if model.projector_mlp is not None:
+        linear(model.projector_mlp, "classifier")

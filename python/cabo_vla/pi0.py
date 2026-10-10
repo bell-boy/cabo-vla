@@ -4,6 +4,7 @@ import jax.numpy as jnp
 from einops import rearrange
 from jaxtyping import Float
 
+from cabo_vla.config import VLAConfig
 from cabo_vla.data.dataloader import Batch
 from cabo_vla.vit import ViT
 
@@ -36,24 +37,14 @@ class VLABlock(nnx.Module):
 
 
 class VLA(nnx.Module):
-    def __init__(
-        self,
-        patch_size: int,
-        layers: int,
-        dim: int,
-        heads: int,
-        mlp_dim: int,
-        input_img_size: int = 224,
-        input_state_size: int = 32,
-        action_size: int = 32,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.ViT = ViT(patch_size, layers, dim, heads, mlp_dim, input_img_size, rngs=rngs)
-        self.blocks = nnx.List([VLABlock(dim, heads, mlp_dim, rngs=rngs) for _ in range(layers)])
-        self.state_proj = nnx.Linear(input_state_size, dim, rngs=rngs)
-        self.action_in = nnx.Linear(action_size, dim, rngs=rngs)
-        self.action_out = nnx.Linear(dim, action_size, rngs=rngs)
+    def __init__(self, cfg: VLAConfig, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.ViT = ViT(cfg.vit, rngs=rngs)
+        self.vlm_blocks = nnx.List([VLABlock(cfg.vlm_dim, cfg.heads, cfg.vlm_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
+        self.action_blocks = nnx.List([VLABlock(cfg.action_dim, cfg.heads, cfg.action_mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
+        self.state_proj = nnx.Linear(cfg.state_size, cfg.vlm_dim, rngs=rngs)
+        self.action_in = nnx.Linear(cfg.action_size, cfg.action_dim, rngs=rngs)
+        self.action_out = nnx.Linear(cfg.action_dim, cfg.action_size, rngs=rngs)
 
     def encode_state_imgs(
         self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch Horizon Action"], time: Float[jax.Array, "Batch"]
@@ -68,13 +59,13 @@ class VLA(nnx.Module):
 
         cache = []
         mask = None  #  unused for now, but when we start using pretrained siglip weights, we'll want to prevent the vla from attending to the state tokens (pi 0 style), or if we go pi 0.5 style with fast in the prompt, then we'll need to think more about how we want to structure the mask
-        for block in self.blocks:
-            x, kv = block(x, mask)
+        for block in self.vlm_blocks:
+            x, kv = block(x, mask = mask)
             cache.append(kv)
         return x, cache
 
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: int):
         x = self.action_in(action_t)  # + self.embed_time(traj_time)
-        for block, kv_cache in zip(self.blocks, cache):
+        for block, kv_cache in zip(self.action_blocks, cache):
             x, _ = block(x, kv_cache)
         return self.action_out(x)

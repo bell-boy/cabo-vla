@@ -4,6 +4,8 @@ import jax.numpy as jnp
 from einops import rearrange
 from jaxtyping import Float
 
+from cabo_vla.config import ViTConfig
+
 
 class ViTBlock(nnx.Module):
     def __init__(self, dim: int, heads: int, mlp_dim: int, *, rngs: nnx.Rngs):
@@ -27,40 +29,25 @@ class ViTBlock(nnx.Module):
 
 
 class ViT(nnx.Module):
-    def __init__(
-        self,
-        patch_size: int,
-        layers: int,
-        dim: int,
-        heads: int,
-        mlp_dim: int,
-        input_size: int = 224,
-        cls_out_params: int = 1000,
-        *,
-        rngs: nnx.Rngs,
-    ):
-        self.patch_size = patch_size
-        self.layers = layers
-        self.dim = dim
-        self.heads = heads
-        self.mlp_dim = mlp_dim
-        self.blocks = nnx.List([ViTBlock(dim, heads, mlp_dim, rngs=rngs) for _ in range(layers)])
+    def __init__(self, cfg: ViTConfig, cls_out_params: int = 1000, *, rngs: nnx.Rngs):
+        self.cfg = cfg
+        self.blocks = nnx.List([ViTBlock(cfg.dim, cfg.heads, cfg.mlp_dim, rngs=rngs) for _ in range(cfg.layers)])
         self.patch_embed = nnx.Conv(
             in_features=3,
-            out_features=self.dim,
-            kernel_size=(self.patch_size, self.patch_size),
-            strides=self.patch_size,
+            out_features=cfg.dim,
+            kernel_size=(cfg.patch_size, cfg.patch_size),
+            strides=cfg.patch_size,
             rngs=rngs,
         )
-        self.cls_token = nnx.Param(jnp.zeros((1, 1, dim)))  # might be able to remove with model surgery, or maybe not
-        self.pos_embed = nnx.Param(jnp.zeros((1, (input_size // patch_size) ** 2 + 1, dim)))  # with base config should be 1, 197, 768
-        self.out_norm = nnx.LayerNorm(dim, epsilon=1e-12, rngs=rngs)
-        self.projector_mlp = nnx.Linear(in_features=dim, out_features=cls_out_params, rngs=rngs)
+        self.cls_token = nnx.Param(jnp.zeros((1, 1, cfg.dim)))  # might be able to remove with model surgery, or maybe not
+        self.pos_embed = nnx.Param(jnp.zeros((1, (cfg.input_size // cfg.patch_size) ** 2 + 1, cfg.dim)))  # with base config should be 1, 197, 768
+        self.out_norm = nnx.LayerNorm(cfg.dim, epsilon=1e-12, rngs=rngs)
+        self.projector_mlp = nnx.Linear(in_features=cfg.dim, out_features=cls_out_params, rngs=rngs)
 
     def __call__(self, x: Float[jax.Array, "Batch Channel Height Width"]):
         B = x.shape[0]
         patched = rearrange(self.patch_embed(rearrange(x, "b c h w-> b h w c")), "b h w f -> b (h w) f")
-        with_cls = jnp.concatenate([jnp.broadcast_to(self.cls_token[...], (B, 1, self.dim)), patched], axis=1)
+        with_cls = jnp.concatenate([jnp.broadcast_to(self.cls_token[...], (B, 1, self.cfg.dim)), patched], axis=1)
         x = with_cls + self.pos_embed[...]
         for block in self.blocks:
             x = block(x)
