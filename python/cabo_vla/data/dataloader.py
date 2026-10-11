@@ -15,6 +15,20 @@ from jaxtyping import Float
 from PIL import Image, ImageOps
 
 
+class NormalizationType(Enum):
+    NONE = 1
+    QUANTILE = 2
+    MEANVAR = 3
+
+
+@dataclass
+class Batch:
+    observations: Float[jax.Array, "Batch Camera Channel Height Width"]
+    instruction: list[str]
+    action: Float[jax.Array, "Batch Horizon Action"]
+    prio: Float[jax.Array, "Batch State"]
+
+
 @dataclass
 class _VideoInfo:
     height: int
@@ -27,12 +41,24 @@ class _VideoInfo:
 
 
 @dataclass
+class _Normalization:
+    offset: jax.Array
+    divisor: jax.Array
+    quantile: bool
+
+    def apply(self, value: jax.Array) -> jax.Array:
+        normalized = (value - self.offset) / self.divisor
+        return 2 * normalized - 1 if self.quantile else normalized
+
+
+@dataclass
 class _DatasetFeature:
     name: str
     dtype: str
     shape: list[int]
     names: list[str] | None = None
     info: _VideoInfo | None = None
+    normalization: _Normalization | None = None
 
 
 @dataclass
@@ -148,7 +174,9 @@ def _parse_video_info(info: dict) -> _VideoInfo:
     )
 
 
-def _parse_dataset_feature(name: str, feature: dict) -> _DatasetFeature:
+def _parse_dataset_feature(
+    name: str, feature: dict, mode: NormalizationType, stats: dict
+) -> _DatasetFeature:
     if not isinstance(dtype := feature.get("dtype"), str):
         raise RuntimeError('Expected "dtype" to be a string.')
     if not isinstance(shape := feature.get("shape"), list) or any(
@@ -163,50 +191,42 @@ def _parse_dataset_feature(name: str, feature: dict) -> _DatasetFeature:
     info = feature.get("info")
     if info is not None and not isinstance(info, dict):
         raise RuntimeError('Expected "info" to be a JSON dict or null.')
-    return _DatasetFeature(
+    parsed = _DatasetFeature(
         name=name,
         dtype=dtype,
         shape=shape,
         names=names,
         info=_parse_video_info(info) if info is not None else None,
     )
+    parsed.normalization = _parse_normalization(parsed, mode, stats)
+    return parsed
 
 
 def _read_row(
     path: Path,
-    row_index: int,
+    frame_index: int,
     columns: list[str] | None = None,
     *,
     num_rows: int = 1,
 ) -> dict[str, list]:
     if num_rows < 0:
         raise ValueError("num_rows must be nonnegative")
-    with pq.ParquetFile(path) as parquet_file:
-        if not 0 <= row_index <= parquet_file.metadata.num_rows or (
-            row_index + num_rows > parquet_file.metadata.num_rows
-        ):
-            raise IndexError("Row range out of bounds")
-        if num_rows == 0:
-            return {}
-
-        offset = row_index
-        remaining = num_rows
-        rows: dict[str, list] = {}
-        for group_index in range(parquet_file.num_row_groups):
-            count = parquet_file.metadata.row_group(group_index).num_rows
-            if offset >= count:
-                offset -= count
-                continue
-            length = min(remaining, count - offset)
-            table = parquet_file.read_row_group(group_index, columns=columns)
-            for name, values in table.slice(offset, length).to_pydict().items():
-                rows.setdefault(name, []).extend(values)
-            remaining -= length
-            if remaining == 0:
-                return rows
-            offset = 0
-
-    raise IndexError("Row range out of bounds")
+    if num_rows == 0:
+        return {}
+    selected_columns = (
+        None if columns is None else list(dict.fromkeys(["index", *columns]))
+    )
+    table = ds.dataset(path, format="parquet").to_table(
+        columns=selected_columns,
+        filter=(ds.field("index") >= frame_index)
+        & (ds.field("index") < frame_index + num_rows),
+    )
+    rows = table.sort_by("index").to_pydict()
+    if rows["index"] != list(range(frame_index, frame_index + num_rows)):
+        raise IndexError("Frame range not found")
+    if columns is not None and "index" not in columns:
+        rows.pop("index")
+    return rows
 
 
 def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
@@ -226,31 +246,6 @@ def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
             if frame.time > timestamp + tolerance:
                 break
     raise RuntimeError(f"No video frame found at {timestamp:.6f}s in {path}.")
-
-
-@dataclass
-class Batch:
-    observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str]
-    action: Float[jax.Array, "Batch Horizon Action"]
-    prio: Float[jax.Array, "Batch State"]
-
-
-class NormalizationType(Enum):
-    NONE = 1
-    QUANTILE = 2
-    MEANVAR = 3
-
-
-@dataclass
-class _Normalization:
-    offset: jax.Array
-    divisor: jax.Array
-    quantile: bool
-
-    def apply(self, value: jax.Array) -> jax.Array:
-        normalized = (value - self.offset) / self.divisor
-        return 2 * normalized - 1 if self.quantile else normalized
 
 
 def _parse_normalization(
@@ -310,9 +305,6 @@ class Dataloader:
         self._resolution = resolution
         if not jnp.issubdtype(dtype, jnp.floating):
             raise ValueError("dtype must be floating point for normalized observations")
-        for name, mode in action_features + prio_features:
-            if not isinstance(mode, NormalizationType):
-                raise ValueError(f"Invalid normalization type for {name}: {mode!r}")
 
         info_file = self._path / "meta" / "info.json"
         with open(info_file) as f:
@@ -331,34 +323,14 @@ class Dataloader:
         for feature_name in observation_features:
             if not isinstance(feature_dict := features.get(feature_name), dict):
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(feature_name, feature_dict)
+            feature = _parse_dataset_feature(
+                feature_name, feature_dict, NormalizationType.NONE, {}
+            )
             if feature.dtype not in {"image", "video"}:
                 raise RuntimeError(
                     f"Observation feature {feature_name} has unsupported dtype {feature.dtype}"
                 )
             self._observation_features.append(feature)
-
-        self._action_features: list[_DatasetFeature] = []
-        for feature_name, _ in action_features:
-            if not isinstance(feature_dict := features.get(feature_name), dict):
-                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(feature_name, feature_dict)
-            if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(
-                    f"Action feature {feature_name} has unsupported dtype {feature.dtype}"
-                )
-            self._action_features.append(feature)
-
-        self._prio_features: list[_DatasetFeature] = []
-        for feature_name, _ in prio_features:
-            if not isinstance(feature_dict := features.get(feature_name), dict):
-                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(feature_name, feature_dict)
-            if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(
-                    f"Prio feature {feature_name} has unsupported dtype {feature.dtype}"
-                )
-            self._prio_features.append(feature)
 
         stats = {}
         if any(
@@ -369,18 +341,28 @@ class Dataloader:
                 stats = json.load(f)
             if not isinstance(stats, dict):
                 raise ValueError("Expected meta/stats.json to contain a JSON dict.")
-        self._action_normalizations = [
-            _parse_normalization(feature, mode, stats)
-            for feature, (_, mode) in zip(
-                self._action_features, action_features, strict=True
-            )
-        ]
-        self._prio_normalizations = [
-            _parse_normalization(feature, mode, stats)
-            for feature, (_, mode) in zip(
-                self._prio_features, prio_features, strict=True
-            )
-        ]
+
+        self._action_features: list[_DatasetFeature] = []
+        for feature_name, mode in action_features:
+            if not isinstance(feature_dict := features.get(feature_name), dict):
+                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
+            feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
+            if feature.dtype in {"image", "video", "string", "large_string"}:
+                raise RuntimeError(
+                    f"Action feature {feature_name} has unsupported dtype {feature.dtype}"
+                )
+            self._action_features.append(feature)
+
+        self._prio_features: list[_DatasetFeature] = []
+        for feature_name, mode in prio_features:
+            if not isinstance(feature_dict := features.get(feature_name), dict):
+                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
+            feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
+            if feature.dtype in {"image", "video", "string", "large_string"}:
+                raise RuntimeError(
+                    f"Prio feature {feature_name} has unsupported dtype {feature.dtype}"
+                )
+            self._prio_features.append(feature)
 
         if action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
@@ -398,17 +380,18 @@ class Dataloader:
         if not 0 <= episode_from <= episode_to:
             raise RuntimeError(f"Invalid episode range for split {split!r}.")
 
-        # Retain all metadata to resolve shard offsets when a split starts mid-file.
-        self._episodes = list(
-            _iter_episodes(
+        self._episodes = [
+            episode
+            for episode in _iter_episodes(
                 self._path,
                 [
                     feature.name
                     for feature in self._observation_features
                     if feature.dtype == "video"
                 ],
-            ),
-        )
+            )
+            if episode_from <= episode.episode_index < episode_to
+        ]
 
         if not isinstance(data_path_template := info.get("data_path"), str):
             raise RuntimeError("Expected string data_path.")
@@ -428,7 +411,6 @@ class Dataloader:
         self._order_buffer = [
             idx
             for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index)
-            if episode_from <= episode.episode_index < episode_to
             for idx in range(
                 episode.data_from_index,
                 episode.data_to_index - self._action_horizon + 1,
@@ -461,35 +443,25 @@ class Dataloader:
         image_features = [
             x.name for x in self._observation_features if x.dtype == "image"
         ]
-        video_features = [
-            x.name for x in self._observation_features if x.dtype == "video"
-        ]
         prio_features = [x.name for x in self._prio_features]
         action_features = [x.name for x in self._action_features]
 
         non_action_features = image_features + prio_features + ["task_index"]
-        if video_features:
+        if any(x.dtype == "video" for x in self._observation_features):
             non_action_features.append("timestamp")
         feature_file = self._data_path_template.format(
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
         )
-        file_from_index = min(
-            ep.data_from_index
-            for ep in self._episodes
-            if (ep.data_chunk_index, ep.data_file_index)
-            == (episode.data_chunk_index, episode.data_file_index)
-        )
-        row_index = idx - file_from_index
         feature_row = {
             name: values[0]
             for name, values in _read_row(
-                self._path / feature_file, row_index, columns=non_action_features
+                self._path / feature_file, idx, columns=non_action_features
             ).items()
         }
         action_rows = _read_row(
             self._path / feature_file,
-            row_index,
+            idx,
             columns=action_features,
             num_rows=self._action_horizon,
         )
@@ -499,9 +471,8 @@ class Dataloader:
         task: str = self._tasks[task_id]
 
         actions: list[Float[jax.Array, "Horizon Action"]] = []
-        for feat, normalization in zip(
-            action_features, self._action_normalizations, strict=True
-        ):
+        for feature in self._action_features:
+            feat = feature.name
             if not isinstance(action := action_rows.get(feat), list):
                 raise RuntimeError(
                     f"Failed to load action feature {feat} for frame {idx}."
@@ -511,14 +482,13 @@ class Dataloader:
             )
             if action_tensor.ndim == 1:
                 action_tensor = action_tensor[:, None]
-            if normalization is not None:
-                action_tensor = normalization.apply(action_tensor)
+            if feature.normalization is not None:
+                action_tensor = feature.normalization.apply(action_tensor)
             actions.append(action_tensor.astype(self._dtype))
 
         prioperception: list[Float[jax.Array, " State"]] = []
-        for feat, normalization in zip(
-            prio_features, self._prio_normalizations, strict=True
-        ):
+        for feature in self._prio_features:
+            feat = feature.name
             if (prio := feature_row.get(feat)) is None:
                 raise RuntimeError(
                     f"Failed to load prio feature {feat} for frame {idx}."
@@ -528,8 +498,8 @@ class Dataloader:
             prio_tensor = jnp.asarray(
                 prio, dtype=jnp.promote_types(self._dtype, jnp.float32)
             )
-            if normalization is not None:
-                prio_tensor = normalization.apply(prio_tensor)
+            if feature.normalization is not None:
+                prio_tensor = feature.normalization.apply(prio_tensor)
             prioperception.append(prio_tensor.astype(self._dtype))
 
         observations: list[Float[jax.Array, "Channel Height Width"]] = []

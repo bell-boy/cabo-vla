@@ -150,6 +150,7 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
     }
     columns.update(
         {
+            "index": pa.array(frame_ids),
             "task_index": pa.array(task_indices),
             "timestamp": pa.array(timestamps),
             IMAGE_CAMERA: pa.array(images),
