@@ -35,6 +35,10 @@ GitHub Actions runs the `Ruff` and `ty` checks on pull requests and pushes to
 `main`. Ruff checks both lint and formatting without changing files; ty checks the
 whole project. Both checks must pass before a pull request can merge into `main`.
 
+The `Tests` workflow runs the Python test suite on CPU with Python 3.12 and the
+locked uv dependencies, plus Rust tests on the stable toolchain. It runs on pull
+requests, pushes to `main`, merge queue updates, and manual dispatches.
+
 ## todo
 
 The goal right now is building an MVP:
