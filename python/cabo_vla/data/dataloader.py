@@ -1,5 +1,3 @@
-"""JAX batching for LeRobot datasets, without PyTorch's DataLoader."""
-
 import json
 import random
 from collections.abc import Iterator
@@ -19,8 +17,6 @@ from PIL import Image, ImageOps
 
 @dataclass
 class _VideoInfo:
-    """Video metadata; field names omit the JSON keys' `video.` prefix."""
-
     height: int
     width: int
     channels: int
@@ -137,7 +133,6 @@ def _iter_episodes(
 
 
 def _parse_video_info(info: dict) -> _VideoInfo:
-    """Parse the required video properties from a LeRobot feature's info."""
     for field, expected in (
         ("height", int),
         ("width", int),
@@ -161,7 +156,6 @@ def _parse_video_info(info: dict) -> _VideoInfo:
 
 
 def _parse_dataset_feature(name: str, feature: dict) -> _DatasetFeature:
-    """Parse a LeRobot feature descriptor, including optional video metadata."""
     if not isinstance(dtype := feature.get("dtype"), str):
         raise RuntimeError('Expected "dtype" to be a string.')
     if not isinstance(shape := feature.get("shape"), list) or any(
