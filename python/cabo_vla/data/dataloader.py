@@ -46,8 +46,6 @@ class _EpisodeVideoMeta:
 
 @dataclass
 class _Episode:
-    """Episode metadata; data bounds are global, half-open dataset indices."""
-
     data_chunk_index: int
     data_file_index: int
     data_from_index: int
@@ -59,11 +57,6 @@ class _Episode:
 def _iter_episodes(
     path: Path, video_features: list[str], batch_size: int = 1024
 ) -> Iterator[_Episode]:
-    """Stream local LeRobot v3 metadata, without reading frame or video files.
-
-    Reference: https://huggingface.co/docs/lerobot/lerobot-dataset-v3
-    Read core episode fields and metadata for only the selected video features.
-    """
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     metadata_path = path / "meta" / "episodes"
@@ -186,11 +179,6 @@ def _read_row(
     *,
     num_rows: int = 1,
 ) -> dict[str, list]:
-    """Read [row_index, row_index + num_rows) using only overlapping row groups.
-
-    Indices are local to the file. Return a dictionary of column lists (or an
-    empty dictionary for zero rows); raise IndexError for an out-of-bounds range.
-    """
     if num_rows < 0:
         raise ValueError("num_rows must be nonnegative")
     with pq.ParquetFile(path) as parquet_file:
@@ -222,7 +210,6 @@ def _read_row(
 
 
 def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
-    """Seek to a preceding keyframe and decode the requested RGB frame."""
     with av.open(str(path)) as container:
         if not container.streams.video:
             raise RuntimeError(f"No video stream found in {path}.")
@@ -257,8 +244,6 @@ class NormalizationType(Enum):
 
 @dataclass
 class _Normalization:
-    """Cached per-component constants; arithmetic stays in float32 or higher."""
-
     offset: jax.Array
     divisor: jax.Array
     quantile: bool
@@ -464,7 +449,6 @@ class Dataloader:
             )
 
     def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str]:
-        """Return observations (Camera, C, H, W), actions (Horizon, A), prio (S,)."""
         episode: _Episode | None = None
         for ep in self._episodes:
             if ep.data_from_index <= idx and idx < ep.data_to_index:
