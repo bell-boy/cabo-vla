@@ -1,19 +1,18 @@
 import functools
 import os
-from dataclasses import dataclass
 
 import flax.nnx as nnx
 import jax
-from flax import struct
 import optax
+from flax import struct
 
 from cabo_vla.config import VLAConfig
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.models.pi0 import VLA
 
-
 jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax"))
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+
 
 @struct.dataclass
 class TrainConfig:
