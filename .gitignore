@@ -8,6 +8,10 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 
+# Local workspace metadata
+.delta/
+.zed/
+
 # Rust-generate files
 target/
 
