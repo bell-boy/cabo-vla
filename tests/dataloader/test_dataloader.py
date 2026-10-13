@@ -14,7 +14,6 @@ from PIL import Image
 from cabo_vla.data.dataloader import (
     Dataloader,
     NormalizationType,
-    ObservationRange,
     PaddingType,
 )
 
@@ -285,7 +284,7 @@ def test_action_windows_and_numeric_feature_selection(
     ],
 )
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
-@pytest.mark.parametrize("observation_range", list(ObservationRange))
+@pytest.mark.parametrize("observation_range", [(0.0, 1.0), (-2.0, 3.0)])
 def test_camera_pixels_selection_and_order(
     tiny_dataset, cameras, dtype, observation_range
 ):
@@ -308,14 +307,15 @@ def test_camera_pixels_selection_and_order(
     assert actual.shape == (len(EXPECTED_STARTS), len(cameras), CHANNELS, HEIGHT, WIDTH)
     assert actual.dtype == dtype
     expected = expected.astype(np.float32) / 255
-    if observation_range == ObservationRange.NEGATIVE_ONE_ONE:
-        expected = 2 * expected - 1
+    lower, upper = observation_range
+    expected = expected * (upper - lower) + lower
     expected = expected.astype(dtype)
     eps = float(np.finfo(dtype).eps)
-    np.testing.assert_allclose(actual, expected, rtol=eps, atol=eps)
-    lower_bound = 0 if observation_range == ObservationRange.ZERO_ONE else -1
-    np.testing.assert_array_equal(actual[:, :, :, 0, 0], lower_bound)
-    np.testing.assert_array_equal(actual[:, :, :, 0, 1], 1)
+    np.testing.assert_allclose(
+        actual, expected, rtol=eps, atol=eps * max(1, abs(upper - lower))
+    )
+    np.testing.assert_array_equal(actual[:, :, :, 0, 0], lower)
+    np.testing.assert_array_equal(actual[:, :, :, 0, 1], upper)
     # Check that image/video samples are paired with the right numeric frame.
     np.testing.assert_array_equal(
         np.concatenate([batch.prio for batch in batches]),

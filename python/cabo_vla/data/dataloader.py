@@ -22,11 +22,6 @@ class NormalizationType(Enum):
     MEANVAR = 3
 
 
-class ObservationRange(Enum):
-    ZERO_ONE = 1
-    NEGATIVE_ONE_ONE = 2
-
-
 class PaddingType(Enum):
     REPEAT_LAST = 1
     ZERO = 2
@@ -303,7 +298,7 @@ class Dataloader:
         observation_features: list[str],
         action_features: list[tuple[str, NormalizationType]],
         prio_features: list[tuple[str, NormalizationType]],
-        observation_range: ObservationRange = ObservationRange.ZERO_ONE,
+        observation_range: tuple[float, float] = (0.0, 1.0),
         padding_type: PaddingType = PaddingType.REPEAT_LAST,
         dtype: jax.typing.DTypeLike = jnp.float32,
         split: str = "train",
@@ -574,8 +569,8 @@ class Dataloader:
                     )
                     / 255
                 ).transpose(2, 0, 1)
-                if self._observation_range == ObservationRange.NEGATIVE_ONE_ONE:
-                    image_tensor = 2 * image_tensor - 1
+                lower, upper = self._observation_range
+                image_tensor = image_tensor * (upper - lower) + lower
                 observations.append(image_tensor.astype(self._dtype))
         return (
             jnp.stack(observations, axis=0)
