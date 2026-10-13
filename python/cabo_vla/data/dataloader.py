@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from flax import struct
 from jaxtyping import Float
 from PIL import Image, ImageOps
 
@@ -33,12 +34,12 @@ class PaddingType(Enum):
     ZERO = 2
 
 
-@dataclass
+@struct.dataclass
 class Batch:
     """Training samples; timestamp is float32 seconds since each episode began."""
 
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str]
+    instruction: list[str] = struct.field(pytree_node=False)
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
     timestamp: Float[jax.Array, "Batch"]
