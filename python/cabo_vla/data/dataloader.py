@@ -28,16 +28,12 @@ class ObservationRange(Enum):
 
 
 class PaddingType(Enum):
-    """Padding applied to actions after normalization at episode boundaries."""
-
     REPEAT_LAST = 1
     ZERO = 2
 
 
 @struct.dataclass
 class Batch:
-    """Training samples; timestamp is float32 seconds since each episode began."""
-
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
     instruction: list[str] = struct.field(pytree_node=False)
     action: Float[jax.Array, "Batch Horizon Action"]
