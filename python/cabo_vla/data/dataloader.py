@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
+from flax import struct
 from jaxtyping import Float
 from PIL import Image, ImageOps
 
@@ -21,12 +22,18 @@ class NormalizationType(Enum):
     MEANVAR = 3
 
 
-@dataclass
+class PaddingType(Enum):
+    REPEAT_LAST = 1
+    ZERO = 2
+
+
+@struct.dataclass
 class Batch:
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str]
+    instruction: list[str] = struct.field(pytree_node=False)
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
+    timestamp: Float[jax.Array, "Batch"]
 
 
 @dataclass
@@ -291,6 +298,8 @@ class Dataloader:
         observation_features: list[str],
         action_features: list[tuple[str, NormalizationType]],
         prio_features: list[tuple[str, NormalizationType]],
+        observation_range: tuple[float, float] = (0.0, 1.0),
+        padding_type: PaddingType = PaddingType.REPEAT_LAST,
         dtype: jax.typing.DTypeLike = jnp.float32,
         split: str = "train",
         shuffle: bool = True,
@@ -303,6 +312,8 @@ class Dataloader:
         self._shuffle = shuffle
         self._dtype = dtype
         self._resolution = resolution
+        self._observation_range = observation_range
+        self._padding_type = padding_type
         if not jnp.issubdtype(dtype, jnp.floating):
             raise ValueError("dtype must be floating point for normalized observations")
 
@@ -411,10 +422,7 @@ class Dataloader:
         self._order_buffer = [
             idx
             for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index)
-            for idx in range(
-                episode.data_from_index,
-                episode.data_to_index - self._action_horizon + 1,
-            )
+            for idx in range(episode.data_from_index, episode.data_to_index)
         ]
 
     def __iter__(self):
@@ -428,9 +436,12 @@ class Dataloader:
                 instruction=[s[3] for s in samples],
                 action=jnp.stack([s[1] for s in samples], axis=0),
                 prio=jnp.stack([s[2] for s in samples], axis=0),
+                timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
             )
 
-    def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str]:
+    def _fetch_single(
+        self, idx: int
+    ) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
         episode: _Episode | None = None
         for ep in self._episodes:
             if ep.data_from_index <= idx and idx < ep.data_to_index:
@@ -446,9 +457,9 @@ class Dataloader:
         prio_features = [x.name for x in self._prio_features]
         action_features = [x.name for x in self._action_features]
 
-        non_action_features = image_features + prio_features + ["task_index"]
-        if any(x.dtype == "video" for x in self._observation_features):
-            non_action_features.append("timestamp")
+        non_action_features = (
+            image_features + prio_features + ["task_index", "timestamp"]
+        )
         feature_file = self._data_path_template.format(
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
@@ -459,11 +470,12 @@ class Dataloader:
                 self._path / feature_file, idx, columns=non_action_features
             ).items()
         }
+        action_count = min(self._action_horizon, episode.data_to_index - idx)
         action_rows = _read_row(
             self._path / feature_file,
             idx,
             columns=action_features,
-            num_rows=self._action_horizon,
+            num_rows=action_count,
         )
 
         if not isinstance(task_id := feature_row.get("task_index"), int):
@@ -484,6 +496,14 @@ class Dataloader:
                 action_tensor = action_tensor[:, None]
             if feature.normalization is not None:
                 action_tensor = feature.normalization.apply(action_tensor)
+            if action_count < self._action_horizon:
+                action_tensor = jnp.pad(
+                    action_tensor,
+                    ((0, self._action_horizon - action_count), (0, 0)),
+                    mode="edge"
+                    if self._padding_type == PaddingType.REPEAT_LAST
+                    else "constant",
+                )
             actions.append(action_tensor.astype(self._dtype))
 
         prioperception: list[Float[jax.Array, " State"]] = []
@@ -543,10 +563,15 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(
-                    2, 0, 1
-                )
-                observations.append(image_tensor)
+                image_tensor = (
+                    jnp.asarray(
+                        image, dtype=jnp.promote_types(self._dtype, jnp.float32)
+                    )
+                    / 255
+                ).transpose(2, 0, 1)
+                lower, upper = self._observation_range
+                image_tensor = image_tensor * (upper - lower) + lower
+                observations.append(image_tensor.astype(self._dtype))
         return (
             jnp.stack(observations, axis=0)
             if observations
@@ -560,4 +585,5 @@ class Dataloader:
             if prioperception
             else jnp.empty((0,), self._dtype),
             task,
+            feature_row["timestamp"],
         )

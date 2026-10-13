@@ -11,7 +11,11 @@ import pyarrow.parquet as pq
 import pytest
 from PIL import Image
 
-from cabo_vla.data.dataloader import Dataloader, NormalizationType
+from cabo_vla.data.dataloader import (
+    Dataloader,
+    NormalizationType,
+    PaddingType,
+)
 
 EPISODE_LENGTHS = (4, 3)
 TASKS = ("pick up", "put down")
@@ -39,11 +43,25 @@ CAMERA_BASES = {IMAGE_CAMERA: 20, VIDEO_CAMERA: 120}
 PIXEL_FRAME_STRIDE = 10
 PIXEL_CHANNEL_STRIDE = 20
 
-# Hand-checked oracle for lengths (4, 3) and horizon 3. Do not compute this
-# with the loader's episode/window algorithm: it should catch bugs there.
-EXPECTED_WINDOWS = np.array([[0, 1, 2], [1, 2, 3], [4, 5, 6]])
+# Hand-checked oracle for lengths (4, 3) and horizon 3, repeating final actions.
+# Do not compute this with the loader's episode/window algorithm.
+EXPECTED_WINDOWS = np.array(
+    [[0, 1, 2], [1, 2, 3], [2, 3, 3], [3, 3, 3], [4, 5, 6], [5, 6, 6], [6, 6, 6]]
+)
+EXPECTED_PADDING = np.array(
+    [
+        [False, False, False],
+        [False, False, False],
+        [False, False, True],
+        [False, True, True],
+        [False, False, False],
+        [False, False, True],
+        [False, True, True],
+    ]
+)
 EXPECTED_STARTS = EXPECTED_WINDOWS[:, 0]
-EXPECTED_TASKS = [TASKS[0], TASKS[0], TASKS[1]]
+EXPECTED_TASKS = [TASKS[0]] * 4 + [TASKS[1]] * 3
+EXPECTED_TIMESTAMPS = np.array([0, 0.1, 0.2, 0.3, 0, 0.1, 0.2], dtype=np.float32)
 
 
 def write_video(path: Path, frames: np.ndarray) -> None:
@@ -81,6 +99,8 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
             + np.arange(WIDTH)[None, None, :, None]
             + PIXEL_CHANNEL_STRIDE * np.arange(CHANNELS)[None, None, None, :]
         ).astype(np.uint8)
+        source[name][:, 0, 0] = 0
+        source[name][:, 0, 1] = 255
 
     metadata_path = root / "meta/episodes/chunk-000/file-000.parquet"
     data_path = root / DATA_PATH.format(chunk_index=0, file_index=0)
@@ -169,17 +189,27 @@ def tiny_dataset(tmp_path):
     return tmp_path, write_tiny_dataset(tmp_path)
 
 
-def make_loader(path, *, actions, states, cameras=(), dtype=jnp.float32):
+def make_loader(
+    path,
+    *,
+    actions,
+    states,
+    cameras=(),
+    dtype=jnp.float32,
+    action_horizon=HORIZON,
+    **kwargs,
+):
     return Dataloader(
         path,
         resolution=(WIDTH, HEIGHT),
         batch_size=BATCH_SIZE,
-        action_horizon=HORIZON,
+        action_horizon=action_horizon,
         observation_features=list(cameras),
         action_features=[(name, NormalizationType.NONE) for name in actions],
         prio_features=[(name, NormalizationType.NONE) for name in states],
         shuffle=False,
         dtype=dtype,
+        **kwargs,
     )
 
 
@@ -200,12 +230,17 @@ def make_loader(path, *, actions, states, cameras=(), dtype=jnp.float32):
         pytest.param(["action.gripper"], ["state.force"], id="scalars-only"),
     ],
 )
-def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, states):
+@pytest.mark.parametrize("padding_type", list(PaddingType))
+def test_action_windows_and_numeric_feature_selection(
+    tiny_dataset, actions, states, padding_type
+):
     path, source = tiny_dataset
-    batches = list(make_loader(path, actions=actions, states=states))
+    batches = list(
+        make_loader(path, actions=actions, states=states, padding_type=padding_type)
+    )
 
-    assert len(batches) == 2
-    first, last = batches
+    assert len(batches) == 4
+    first, last = batches[0], batches[-1]
     action_width = sum(NUMERIC_FEATURES[name][1] for name in actions)
     state_width = sum(NUMERIC_FEATURES[name][1] for name in states)
     assert first.action.shape == (BATCH_SIZE, HORIZON, action_width)
@@ -213,10 +248,12 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
     assert first.prio.shape == (BATCH_SIZE, state_width)
     assert last.prio.shape == (1, state_width)
 
-    # Index the original arrays using the explicitly enumerated valid windows.
+    # Index the original arrays using the explicitly enumerated padded windows.
     expected_actions = np.concatenate(
         [source[name][EXPECTED_WINDOWS] for name in actions], axis=-1
     )
+    if padding_type == PaddingType.ZERO:
+        expected_actions[EXPECTED_PADDING] = 0
     expected_states = np.concatenate(
         [source[name][EXPECTED_STARTS] for name in states], axis=-1
     )
@@ -227,9 +264,14 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
         np.concatenate([batch.prio for batch in batches]), expected_states
     )
     assert [task for batch in batches for task in batch.instruction] == EXPECTED_TASKS
+    np.testing.assert_array_equal(
+        np.concatenate([batch.timestamp for batch in batches]), EXPECTED_TIMESTAMPS
+    )
     for batch in batches:
         assert batch.action.dtype == np.float32
         assert batch.prio.dtype == np.float32
+        assert batch.timestamp.dtype == np.float32
+        assert batch.timestamp.shape == (len(batch.instruction),)
 
 
 @pytest.mark.parametrize(
@@ -242,7 +284,10 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
     ],
 )
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
-def test_camera_pixels_selection_and_order(tiny_dataset, cameras, dtype):
+@pytest.mark.parametrize("observation_range", [(0.0, 1.0), (-2.0, 3.0)])
+def test_camera_pixels_selection_and_order(
+    tiny_dataset, cameras, dtype, observation_range
+):
     path, source = tiny_dataset
     batches = list(
         make_loader(
@@ -251,6 +296,7 @@ def test_camera_pixels_selection_and_order(tiny_dataset, cameras, dtype):
             states=["state.joints"],
             cameras=cameras,
             dtype=dtype,
+            observation_range=observation_range,
         )
     )
     actual = np.concatenate([batch.observations for batch in batches])
@@ -260,8 +306,16 @@ def test_camera_pixels_selection_and_order(tiny_dataset, cameras, dtype):
     )
     assert actual.shape == (len(EXPECTED_STARTS), len(cameras), CHANNELS, HEIGHT, WIDTH)
     assert actual.dtype == dtype
-    expected = (expected.astype(np.float32) / 255).astype(dtype)
-    np.testing.assert_allclose(actual, expected, rtol=float(np.finfo(dtype).eps))
+    expected = expected.astype(np.float32) / 255
+    lower, upper = observation_range
+    expected = expected * (upper - lower) + lower
+    expected = expected.astype(dtype)
+    eps = float(np.finfo(dtype).eps)
+    np.testing.assert_allclose(
+        actual, expected, rtol=eps, atol=eps * max(1, abs(upper - lower))
+    )
+    np.testing.assert_array_equal(actual[:, :, :, 0, 0], lower)
+    np.testing.assert_array_equal(actual[:, :, :, 0, 1], upper)
     # Check that image/video samples are paired with the right numeric frame.
     np.testing.assert_array_equal(
         np.concatenate([batch.prio for batch in batches]),
@@ -270,7 +324,10 @@ def test_camera_pixels_selection_and_order(tiny_dataset, cameras, dtype):
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_mixed_normalization_preserves_values_order_and_dtype(tiny_dataset, dtype):
+@pytest.mark.parametrize("padding_type", list(PaddingType))
+def test_mixed_normalization_preserves_values_order_and_dtype(
+    tiny_dataset, dtype, padding_type
+):
     path, source = tiny_dataset
     # Different per-component scales catch accidental scalar broadcasting.
     mean = source["action.arm"][0]
@@ -302,6 +359,7 @@ def test_mixed_normalization_preserves_values_order_and_dtype(tiny_dataset, dtyp
         ],
         dtype=dtype,
         shuffle=False,
+        padding_type=padding_type,
     )
     batches = list(loader)
     expected_actions = np.concatenate(
@@ -311,6 +369,8 @@ def test_mixed_normalization_preserves_values_order_and_dtype(tiny_dataset, dtyp
         ],
         axis=-1,
     )
+    if padding_type == PaddingType.ZERO:
+        expected_actions[EXPECTED_PADDING] = 0
     expected_states = np.concatenate(
         [
             2 * (source["state.joints"][EXPECTED_STARTS] - lower) / (upper - lower) - 1,
