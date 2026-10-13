@@ -66,12 +66,7 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
     """Write real files and retain their source arrays as expected-value inputs."""
     frame_count = sum(EPISODE_LENGTHS)
     frame_ids = np.arange(frame_count)
-    source = {
-        name: (base + FRAME_STRIDE * frame_ids[:, None] + np.arange(width)).astype(
-            np.float32
-        )
-        for name, (base, width) in NUMERIC_FEATURES.items()
-    }
+    source = {name: (base + FRAME_STRIDE * frame_ids[:, None] + np.arange(width)).astype(np.float32) for name, (base, width) in NUMERIC_FEATURES.items()}
     for name, base in CAMERA_BASES.items():
         # Vary frame, channel, row and column: even transposes and flips show up.
         source[name] = (
@@ -86,10 +81,7 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
     data_path = root / DATA_PATH.format(chunk_index=0, file_index=0)
     metadata_path.parent.mkdir(parents=True)
     data_path.parent.mkdir(parents=True)
-    features = {
-        name: {"dtype": "float32", "shape": [width]}
-        for name, (_, width) in NUMERIC_FEATURES.items()
-    }
+    features = {name: {"dtype": "float32", "shape": [width]} for name, (_, width) in NUMERIC_FEATURES.items()}
     features.update(
         {
             IMAGE_CAMERA: {"dtype": "image", "shape": [HEIGHT, WIDTH, CHANNELS]},
@@ -107,9 +99,7 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
             }
         )
     )
-    pd.DataFrame({"task_index": range(len(TASKS))}, index=np.asarray(TASKS)).to_parquet(
-        root / "meta/tasks.parquet"
-    )
+    pd.DataFrame({"task_index": range(len(TASKS))}, index=np.asarray(TASKS)).to_parquet(root / "meta/tasks.parquet")
 
     episodes, task_indices, timestamps = [], [], []
     start = 0
@@ -214,18 +204,10 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
     assert last.prio.shape == (1, state_width)
 
     # Index the original arrays using the explicitly enumerated valid windows.
-    expected_actions = np.concatenate(
-        [source[name][EXPECTED_WINDOWS] for name in actions], axis=-1
-    )
-    expected_states = np.concatenate(
-        [source[name][EXPECTED_STARTS] for name in states], axis=-1
-    )
-    np.testing.assert_array_equal(
-        np.concatenate([batch.action for batch in batches]), expected_actions
-    )
-    np.testing.assert_array_equal(
-        np.concatenate([batch.prio for batch in batches]), expected_states
-    )
+    expected_actions = np.concatenate([source[name][EXPECTED_WINDOWS] for name in actions], axis=-1)
+    expected_states = np.concatenate([source[name][EXPECTED_STARTS] for name in states], axis=-1)
+    np.testing.assert_array_equal(np.concatenate([batch.action for batch in batches]), expected_actions)
+    np.testing.assert_array_equal(np.concatenate([batch.prio for batch in batches]), expected_states)
     assert [task for batch in batches for task in batch.instruction] == EXPECTED_TASKS
     for batch in batches:
         assert batch.action.dtype == np.float32

@@ -80,21 +80,15 @@ class _Episode:
     episode_index: int
 
 
-def _iter_episodes(
-    path: Path, video_features: list[str], batch_size: int = 1024
-) -> Iterator[_Episode]:
+def _iter_episodes(path: Path, video_features: list[str], batch_size: int = 1024) -> Iterator[_Episode]:
     if batch_size <= 0:
         raise ValueError("batch_size must be positive")
     metadata_path = path / "meta" / "episodes"
     if not metadata_path.is_dir():
-        raise FileNotFoundError(
-            f"No episode metadata Parquet files found in {metadata_path}"
-        )
+        raise FileNotFoundError(f"No episode metadata Parquet files found in {metadata_path}")
     dataset = ds.dataset(metadata_path, format="parquet")
     if not dataset.files:
-        raise FileNotFoundError(
-            f"No episode metadata Parquet files found in {metadata_path}"
-        )
+        raise FileNotFoundError(f"No episode metadata Parquet files found in {metadata_path}")
 
     required = (
         "episode_index",
@@ -105,21 +99,15 @@ def _iter_episodes(
         "dataset_to_index",
     )
     columns = list(required) + [
-        f"videos/{feature}/{field}"
-        for feature in video_features
-        for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
+        f"videos/{feature}/{field}" for feature in video_features for field in ("chunk_index", "file_index", "from_timestamp", "to_timestamp")
     ]
     for batch in dataset.to_batches(columns=columns, batch_size=batch_size):
         for row in batch.to_pylist():
             for key in required:
                 if type(row.get(key)) is not int or row[key] < 0:
-                    raise RuntimeError(
-                        f"Expected nonnegative integer {key!r} in {metadata_path}."
-                    )
+                    raise RuntimeError(f"Expected nonnegative integer {key!r} in {metadata_path}.")
             if row["dataset_to_index"] - row["dataset_from_index"] != row["length"]:
-                raise RuntimeError(
-                    f"Episode length does not match frame bounds in {metadata_path}."
-                )
+                raise RuntimeError(f"Episode length does not match frame bounds in {metadata_path}.")
 
             videos = []
             for feature in video_features:
@@ -137,9 +125,7 @@ def _iter_episodes(
                         )
                     )
                 except KeyError as error:
-                    raise RuntimeError(
-                        f"Missing video metadata {error.args[0]!r} in {metadata_path}."
-                    ) from error
+                    raise RuntimeError(f"Missing video metadata {error.args[0]!r} in {metadata_path}.") from error
 
             yield _Episode(
                 data_chunk_index=row["data/chunk_index"],
@@ -174,19 +160,13 @@ def _parse_video_info(info: dict) -> _VideoInfo:
     )
 
 
-def _parse_dataset_feature(
-    name: str, feature: dict, mode: NormalizationType, stats: dict
-) -> _DatasetFeature:
+def _parse_dataset_feature(name: str, feature: dict, mode: NormalizationType, stats: dict) -> _DatasetFeature:
     if not isinstance(dtype := feature.get("dtype"), str):
         raise RuntimeError('Expected "dtype" to be a string.')
-    if not isinstance(shape := feature.get("shape"), list) or any(
-        type(dimension) is not int for dimension in shape
-    ):
+    if not isinstance(shape := feature.get("shape"), list) or any(type(dimension) is not int for dimension in shape):
         raise RuntimeError('Expected "shape" to be a list of integers.')
     names = feature.get("names")
-    if names is not None and (
-        not isinstance(names, list) or any(not isinstance(name, str) for name in names)
-    ):
+    if names is not None and (not isinstance(names, list) or any(not isinstance(name, str) for name in names)):
         raise RuntimeError('Expected "names" to be a list of strings or null.')
     info = feature.get("info")
     if info is not None and not isinstance(info, dict):
@@ -213,13 +193,10 @@ def _read_row(
         raise ValueError("num_rows must be nonnegative")
     if num_rows == 0:
         return {}
-    selected_columns = (
-        None if columns is None else list(dict.fromkeys(["index", *columns]))
-    )
+    selected_columns = None if columns is None else list(dict.fromkeys(["index", *columns]))
     table = ds.dataset(path, format="parquet").to_table(
         columns=selected_columns,
-        filter=(ds.field("index") >= frame_index)
-        & (ds.field("index") < frame_index + num_rows),
+        filter=(ds.field("index") >= frame_index) & (ds.field("index") < frame_index + num_rows),
     )
     rows = table.sort_by("index").to_pydict()
     if rows["index"] != list(range(frame_index, frame_index + num_rows)):
@@ -248,9 +225,7 @@ def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
     raise RuntimeError(f"No video frame found at {timestamp:.6f}s in {path}.")
 
 
-def _parse_normalization(
-    feature: _DatasetFeature, mode: NormalizationType, stats: dict
-) -> _Normalization | None:
+def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stats: dict) -> _Normalization | None:
     if mode == NormalizationType.NONE:
         return None
     keys = ("mean", "std") if mode == NormalizationType.MEANVAR else ("q01", "q99")
@@ -259,15 +234,9 @@ def _parse_normalization(
         try:
             value = jnp.asarray(stats[feature.name][key], dtype=jnp.float32)
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(
-                f"Missing or invalid {key} statistics for {feature.name}."
-            ) from error
-        if value.shape != tuple(feature.shape) or not bool(
-            jnp.all(jnp.isfinite(value))
-        ):
-            raise ValueError(
-                f"Expected finite {key} statistics with shape {feature.shape} for {feature.name}."
-            )
+            raise ValueError(f"Missing or invalid {key} statistics for {feature.name}.") from error
+        if value.shape != tuple(feature.shape) or not bool(jnp.all(jnp.isfinite(value))):
+            raise ValueError(f"Expected finite {key} statistics with shape {feature.shape} for {feature.name}.")
         values.append(value)
     offset, upper_or_std = values
     quantile = mode == NormalizationType.QUANTILE
@@ -323,20 +292,13 @@ class Dataloader:
         for feature_name in observation_features:
             if not isinstance(feature_dict := features.get(feature_name), dict):
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(
-                feature_name, feature_dict, NormalizationType.NONE, {}
-            )
+            feature = _parse_dataset_feature(feature_name, feature_dict, NormalizationType.NONE, {})
             if feature.dtype not in {"image", "video"}:
-                raise RuntimeError(
-                    f"Observation feature {feature_name} has unsupported dtype {feature.dtype}"
-                )
+                raise RuntimeError(f"Observation feature {feature_name} has unsupported dtype {feature.dtype}")
             self._observation_features.append(feature)
 
         stats = {}
-        if any(
-            mode != NormalizationType.NONE
-            for _, mode in action_features + prio_features
-        ):
+        if any(mode != NormalizationType.NONE for _, mode in action_features + prio_features):
             with open(self._path / "meta" / "stats.json") as f:
                 stats = json.load(f)
             if not isinstance(stats, dict):
@@ -348,9 +310,7 @@ class Dataloader:
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
             feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
             if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(
-                    f"Action feature {feature_name} has unsupported dtype {feature.dtype}"
-                )
+                raise RuntimeError(f"Action feature {feature_name} has unsupported dtype {feature.dtype}")
             self._action_features.append(feature)
 
         self._prio_features: list[_DatasetFeature] = []
@@ -359,9 +319,7 @@ class Dataloader:
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
             feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
             if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(
-                    f"Prio feature {feature_name} has unsupported dtype {feature.dtype}"
-                )
+                raise RuntimeError(f"Prio feature {feature_name} has unsupported dtype {feature.dtype}")
             self._prio_features.append(feature)
 
         if action_horizon <= 0:
@@ -374,9 +332,7 @@ class Dataloader:
         try:
             episode_from, episode_to = map(int, episode_range.split(":"))
         except ValueError as error:
-            raise RuntimeError(
-                f"Expected an episode range 'start:end' for split {split!r}."
-            ) from error
+            raise RuntimeError(f"Expected an episode range 'start:end' for split {split!r}.") from error
         if not 0 <= episode_from <= episode_to:
             raise RuntimeError(f"Invalid episode range for split {split!r}.")
 
@@ -384,11 +340,7 @@ class Dataloader:
             episode
             for episode in _iter_episodes(
                 self._path,
-                [
-                    feature.name
-                    for feature in self._observation_features
-                    if feature.dtype == "video"
-                ],
+                [feature.name for feature in self._observation_features if feature.dtype == "video"],
             )
             if episode_from <= episode.episode_index < episode_to
         ]
@@ -402,11 +354,7 @@ class Dataloader:
             if not isinstance(self._video_path_template, str):
                 raise RuntimeError("Expected string video_path for video observations.")
 
-        self._tasks: list[str] = (
-            pq.read_table(self._path / "meta" / "tasks.parquet")
-            .to_pandas()
-            .index.tolist()
-        )
+        self._tasks: list[str] = pq.read_table(self._path / "meta" / "tasks.parquet").to_pandas().index.tolist()
 
         self._order_buffer = [
             idx
@@ -440,9 +388,7 @@ class Dataloader:
         if episode is None:
             raise RuntimeError(f"Index {idx} is out of bounds.")
 
-        image_features = [
-            x.name for x in self._observation_features if x.dtype == "image"
-        ]
+        image_features = [x.name for x in self._observation_features if x.dtype == "image"]
         prio_features = [x.name for x in self._prio_features]
         action_features = [x.name for x in self._action_features]
 
@@ -453,12 +399,7 @@ class Dataloader:
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
         )
-        feature_row = {
-            name: values[0]
-            for name, values in _read_row(
-                self._path / feature_file, idx, columns=non_action_features
-            ).items()
-        }
+        feature_row = {name: values[0] for name, values in _read_row(self._path / feature_file, idx, columns=non_action_features).items()}
         action_rows = _read_row(
             self._path / feature_file,
             idx,
@@ -474,12 +415,8 @@ class Dataloader:
         for feature in self._action_features:
             feat = feature.name
             if not isinstance(action := action_rows.get(feat), list):
-                raise RuntimeError(
-                    f"Failed to load action feature {feat} for frame {idx}."
-                )
-            action_tensor = jnp.asarray(
-                action, dtype=jnp.promote_types(self._dtype, jnp.float32)
-            )
+                raise RuntimeError(f"Failed to load action feature {feat} for frame {idx}.")
+            action_tensor = jnp.asarray(action, dtype=jnp.promote_types(self._dtype, jnp.float32))
             if action_tensor.ndim == 1:
                 action_tensor = action_tensor[:, None]
             if feature.normalization is not None:
@@ -490,14 +427,10 @@ class Dataloader:
         for feature in self._prio_features:
             feat = feature.name
             if (prio := feature_row.get(feat)) is None:
-                raise RuntimeError(
-                    f"Failed to load prio feature {feat} for frame {idx}."
-                )
+                raise RuntimeError(f"Failed to load prio feature {feat} for frame {idx}.")
             if not isinstance(prio, list):
                 prio = [prio]
-            prio_tensor = jnp.asarray(
-                prio, dtype=jnp.promote_types(self._dtype, jnp.float32)
-            )
+            prio_tensor = jnp.asarray(prio, dtype=jnp.promote_types(self._dtype, jnp.float32))
             if feature.normalization is not None:
                 prio_tensor = feature.normalization.apply(prio_tensor)
             prioperception.append(prio_tensor.astype(self._dtype))
@@ -508,26 +441,16 @@ class Dataloader:
             feat = feature.name
             if feature.dtype == "image":
                 if not isinstance(image_struct := feature_row.get(feat), dict):
-                    raise RuntimeError(
-                        f"Failed to load image feature {feat} for frame {idx}."
-                    )
+                    raise RuntimeError(f"Failed to load image feature {feat} for frame {idx}.")
                 if not isinstance(img_bytes := image_struct.get("bytes"), bytes):
-                    raise RuntimeError(
-                        f"Failed to load image bytes for feature {feat}."
-                    )
+                    raise RuntimeError(f"Failed to load image bytes for feature {feat}.")
                 source_image = Image.open(BytesIO(img_bytes))
             else:
                 if (meta := video_metadata.get(feat)) is None:
-                    raise RuntimeError(
-                        f"Missing video metadata for feature {feat} in episode "
-                        f"{episode.episode_index}."
-                    )
+                    raise RuntimeError(f"Missing video metadata for feature {feat} in episode {episode.episode_index}.")
                 timestamp = meta.from_timestamp + feature_row["timestamp"]
                 if not meta.from_timestamp <= timestamp < meta.to_timestamp:
-                    raise RuntimeError(
-                        f"Video timestamp {timestamp} is outside episode "
-                        f"{episode.episode_index} for feature {feat}."
-                    )
+                    raise RuntimeError(f"Video timestamp {timestamp} is outside episode {episode.episode_index} for feature {feat}.")
                 assert isinstance(self._video_path_template, str)
                 video_file = self._video_path_template.format(
                     video_key=feat,
@@ -543,21 +466,11 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(
-                    2, 0, 1
-                )
+                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(2, 0, 1)
                 observations.append(image_tensor)
         return (
-            jnp.stack(observations, axis=0)
-            if observations
-            else jnp.empty(
-                (0, 3, self._resolution[1], self._resolution[0]), self._dtype
-            ),
-            jnp.concatenate(actions, axis=-1)
-            if actions
-            else jnp.empty((self._action_horizon, 0), self._dtype),
-            jnp.concatenate(prioperception, axis=-1)
-            if prioperception
-            else jnp.empty((0,), self._dtype),
+            jnp.stack(observations, axis=0) if observations else jnp.empty((0, 3, self._resolution[1], self._resolution[0]), self._dtype),
+            jnp.concatenate(actions, axis=-1) if actions else jnp.empty((self._action_horizon, 0), self._dtype),
+            jnp.concatenate(prioperception, axis=-1) if prioperception else jnp.empty((0,), self._dtype),
             task,
         )
