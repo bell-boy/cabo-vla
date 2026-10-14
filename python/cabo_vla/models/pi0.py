@@ -51,8 +51,7 @@ class VLA(nnx.Module):
         self.time_embed_up = nnx.Linear(cfg.action_dim * 2, cfg.action_dim, rngs=rngs)
         self.time_embed_down = nnx.Linear(cfg.action_dim, cfg.action_dim, rngs=rngs)
 
-    def sin_cos_pos_embed(self, timestamp: Float[jax.Array, " Batch"], max_period: float = 4, min_period: float = 0.004):
-        # consider forcing higher precision calculation like in openpi
+    def sin_cos_pos_embed(self, timestamp: Float[jax.Array, " Batch"], max_period: float = 4, min_period: float = 0.004) -> Float[jax.Array, "Batch D"]:
         frac = jnp.linspace(0, 1, self.cfg.action_dim // 2)
         period = min_period * (max_period / min_period) ** frac
         thetas = timestamp[:, None] * (2 * jnp.pi / period)[None, :]
@@ -77,9 +76,10 @@ class VLA(nnx.Module):
         return x, cache
 
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: Float[jax.Array, " Batch"]):
-        x = jnp.concatenate([self.action_in(action_t) + self.pos_embed[...], self.sin_cos_pos_embed(traj_time, max_period=4.0, min_period=0.004)], axis=-1)
+        x = self.action_in(action_t) + self.pos_embed[...]
+        time_embed = jnp.broadcast_to(self.sin_cos_pos_embed(traj_time, max_period=4.0, min_period=0.004)[:, None], x.shape)
+        x = jnp.concatenate([x, time_embed], axis=-1)
         x = self.time_embed_down(jax.nn.silu(self.time_embed_up(x)))
-        # TODO: add self.embed_time(traj_time)
         for block, kv_cache in zip(self.action_blocks, cache):
             x, _ = block(x, kv_cache)
         return self.action_out(x)
