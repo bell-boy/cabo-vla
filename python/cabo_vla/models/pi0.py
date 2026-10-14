@@ -47,9 +47,19 @@ class VLA(nnx.Module):
         self.state_proj = nnx.Linear(cfg.state_size, cfg.vlm_dim, rngs=rngs)
         self.action_in = nnx.Linear(cfg.action_size, cfg.action_dim, rngs=rngs)
         self.action_out = nnx.Linear(cfg.action_dim, cfg.action_size, rngs=rngs)
+        self.pos_embed = nnx.Param(jnp.zeros((1, cfg.action_chunk_size, cfg.action_dim)))
+        self.time_embed_up = nnx.Linear(cfg.action_dim * 2, cfg.action_dim, rngs=rngs)
+        self.time_embed_down = nnx.Linear(cfg.action_dim, cfg.action_dim, rngs=rngs)
+
+    def sin_cos_pos_embed(self, timestamp: Float[jax.Array, " Batch"], max_period: float = 4, min_period: float = 0.004):
+        # consider forcing higher precision calculation like in openpi
+        frac = jnp.linspace(0, 1, self.cfg.action_dim // 2)
+        period = min_period * (max_period / min_period) ** frac
+        thetas = timestamp[:, None] * (2 * jnp.pi / period)[None, :]
+        return jnp.concatenate([jnp.cos(thetas), jnp.sin(thetas)], axis=-1)
 
     def encode_state_imgs(
-        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch State"], time: Float[jax.Array, " Batch"]
+        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch State"] 
     ):  # pi 0 style state
         # the attention mask is structured in a way to allow for caching the encoding of the state/img prefix and reuse the same intermediate tokens for the action decoding
         B, CA, C, H, W = imgs.shape
@@ -60,14 +70,16 @@ class VLA(nnx.Module):
         x = jnp.concatenate([vit_tokens, jnp.expand_dims(state, axis=1)], axis=1)
 
         cache = []
-        mask = None  #  unused for now, but when we start using pretrained siglip weights, we'll want to prevent the vla from attending to the state tokens (pi 0 style), or if we go pi 0.5 style with fast in the prompt, then we'll need to think more about how we want to structure the mask
+        mask = None  # unused for now, but when we start using pretrained siglip weights, we'll want to prevent the vla from attending to the state tokens (pi 0 style), or if we go pi 0.5 style with fast in the prompt, then we'll need to think more about how we want to structure the mask
         for block in self.vlm_blocks:
             x, kv = block(x, mask=mask)
             cache.append(kv)
         return x, cache
 
     def run_action_head(self, cache, action_t: Float[jax.Array, "Batch Horizon Action"], traj_time: Float[jax.Array, " Batch"]):
-        x = self.action_in(action_t)  # TODO: add self.embed_time(traj_time)
+        x = jnp.concatenate([self.action_in(action_t) + self.pos_embed[...], self.sin_cos_pos_embed(traj_time, max_period=4.0, min_period=0.004)], axis=-1)
+        x = self.time_embed_down(jax.nn.silu(self.time_embed_up(x)))
+        # TODO: add self.embed_time(traj_time)
         for block, kv_cache in zip(self.action_blocks, cache):
             x, _ = block(x, kv_cache)
         return self.action_out(x)
