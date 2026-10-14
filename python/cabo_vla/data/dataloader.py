@@ -368,9 +368,7 @@ class Dataloader:
         self._tasks: list[str] = pq.read_table(self._path / "meta" / "tasks.parquet").to_pandas().index.tolist()
 
         self._order_buffer = [
-            idx
-            for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index)
-            for idx in range(episode.data_from_index, episode.data_to_index)
+            idx for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index) for idx in range(episode.data_from_index, episode.data_to_index)
         ]
 
     def __iter__(self):
@@ -387,9 +385,7 @@ class Dataloader:
                 timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
             )
 
-    def _fetch_single(
-        self, idx: int
-    ) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
+    def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
         episode: _Episode | None = None
         for ep in self._episodes:
             if ep.data_from_index <= idx and idx < ep.data_to_index:
@@ -403,19 +399,12 @@ class Dataloader:
         prio_features = [x.name for x in self._prio_features]
         action_features = [x.name for x in self._action_features]
 
-        non_action_features = (
-            image_features + prio_features + ["task_index", "timestamp"]
-        )
+        non_action_features = image_features + prio_features + ["task_index", "timestamp"]
         feature_file = self._data_path_template.format(
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
         )
-        feature_row = {
-            name: values[0]
-            for name, values in _read_row(
-                self._path / feature_file, idx, columns=non_action_features
-            ).items()
-        }
+        feature_row = {name: values[0] for name, values in _read_row(self._path / feature_file, idx, columns=non_action_features).items()}
         action_count = min(self._action_horizon, episode.data_to_index - idx)
         action_rows = _read_row(
             self._path / feature_file,
@@ -442,9 +431,7 @@ class Dataloader:
                 action_tensor = jnp.pad(
                     action_tensor,
                     ((0, self._action_horizon - action_count), (0, 0)),
-                    mode="edge"
-                    if self._padding_type == PaddingType.REPEAT_LAST
-                    else "constant",
+                    mode="edge" if self._padding_type == PaddingType.REPEAT_LAST else "constant",
                 )
             actions.append(action_tensor.astype(self._dtype))
 
@@ -491,9 +478,7 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(
-                    2, 0, 1
-                )
+                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(2, 0, 1)
                 observations.append(image_tensor)
         return (
             jnp.stack(observations, axis=0) if observations else jnp.empty((0, 3, self._resolution[1], self._resolution[0]), self._dtype),

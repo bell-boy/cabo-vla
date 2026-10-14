@@ -45,9 +45,7 @@ PIXEL_CHANNEL_STRIDE = 20
 
 # Hand-checked oracle for lengths (4, 3) and horizon 3, repeating final actions.
 # Do not compute this with the loader's episode/window algorithm.
-EXPECTED_WINDOWS = np.array(
-    [[0, 1, 2], [1, 2, 3], [2, 3, 3], [3, 3, 3], [4, 5, 6], [5, 6, 6], [6, 6, 6]]
-)
+EXPECTED_WINDOWS = np.array([[0, 1, 2], [1, 2, 3], [2, 3, 3], [3, 3, 3], [4, 5, 6], [5, 6, 6], [6, 6, 6]])
 EXPECTED_PADDING = np.array(
     [
         [False, False, False],
@@ -221,13 +219,9 @@ def make_loader(
     ],
 )
 @pytest.mark.parametrize("padding_type", list(PaddingType))
-def test_action_windows_and_numeric_feature_selection(
-    tiny_dataset, actions, states, padding_type
-):
+def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, states, padding_type):
     path, source = tiny_dataset
-    batches = list(
-        make_loader(path, actions=actions, states=states, padding_type=padding_type)
-    )
+    batches = list(make_loader(path, actions=actions, states=states, padding_type=padding_type))
 
     assert len(batches) == 4
     first, last = batches[0], batches[-1]
@@ -239,24 +233,14 @@ def test_action_windows_and_numeric_feature_selection(
     assert last.prio.shape == (1, state_width)
 
     # Index the original arrays using the explicitly enumerated padded windows.
-    expected_actions = np.concatenate(
-        [source[name][EXPECTED_WINDOWS] for name in actions], axis=-1
-    )
+    expected_actions = np.concatenate([source[name][EXPECTED_WINDOWS] for name in actions], axis=-1)
     if padding_type == PaddingType.ZERO:
         expected_actions[EXPECTED_PADDING] = 0
-    expected_states = np.concatenate(
-        [source[name][EXPECTED_STARTS] for name in states], axis=-1
-    )
-    np.testing.assert_array_equal(
-        np.concatenate([batch.action for batch in batches]), expected_actions
-    )
-    np.testing.assert_array_equal(
-        np.concatenate([batch.prio for batch in batches]), expected_states
-    )
+    expected_states = np.concatenate([source[name][EXPECTED_STARTS] for name in states], axis=-1)
+    np.testing.assert_array_equal(np.concatenate([batch.action for batch in batches]), expected_actions)
+    np.testing.assert_array_equal(np.concatenate([batch.prio for batch in batches]), expected_states)
     assert [task for batch in batches for task in batch.instruction] == EXPECTED_TASKS
-    np.testing.assert_array_equal(
-        np.concatenate([batch.timestamp for batch in batches]), EXPECTED_TIMESTAMPS
-    )
+    np.testing.assert_array_equal(np.concatenate([batch.timestamp for batch in batches]), EXPECTED_TIMESTAMPS)
     for batch in batches:
         assert batch.action.dtype == np.float32
         assert batch.prio.dtype == np.float32
@@ -275,9 +259,7 @@ def test_action_windows_and_numeric_feature_selection(
 )
 @pytest.mark.parametrize("dtype", [np.float32, np.float16])
 @pytest.mark.parametrize("observation_range", [(0.0, 1.0), (-2.0, 3.0)])
-def test_camera_pixels_selection_and_order(
-    tiny_dataset, cameras, dtype, observation_range
-):
+def test_camera_pixels_selection_and_order(tiny_dataset, cameras, dtype, observation_range):
     path, source = tiny_dataset
     batches = list(
         make_loader(
@@ -301,9 +283,7 @@ def test_camera_pixels_selection_and_order(
     expected = expected * (upper - lower) + lower
     expected = expected.astype(dtype)
     eps = float(np.finfo(dtype).eps)
-    np.testing.assert_allclose(
-        actual, expected, rtol=eps, atol=eps * max(1, abs(upper - lower))
-    )
+    np.testing.assert_allclose(actual, expected, rtol=eps, atol=eps * max(1, abs(upper - lower)))
     np.testing.assert_array_equal(actual[:, :, :, 0, 0], lower)
     np.testing.assert_array_equal(actual[:, :, :, 0, 1], upper)
     # Check that image/video samples are paired with the right numeric frame.
@@ -315,9 +295,7 @@ def test_camera_pixels_selection_and_order(
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("padding_type", list(PaddingType))
-def test_mixed_normalization_preserves_values_order_and_dtype(
-    tiny_dataset, dtype, padding_type
-):
+def test_mixed_normalization_preserves_values_order_and_dtype(tiny_dataset, dtype, padding_type):
     path, source = tiny_dataset
     # Different per-component scales catch accidental scalar broadcasting.
     mean = source["action.arm"][0]
