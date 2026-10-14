@@ -42,7 +42,8 @@ class TrainState:
 def train_step(state: TrainState, config: TrainConfig, batch: Batch):
     key, noise_key, t_key = jax.random.split(state.key, 3)
 
-    # TODO: add actual forward and backward pass
+    # TODO: @Honyant: I'd like to have multiple draws of the noise per action so that we can reuse the same state/img prefix encoding for multiple action predictions. This emperically, as demonstrated by https://abc.bot/, improves training loss/gpu hour in their setup.
+    # you could flatten dims, and in the action head, check that batch size must be a multiple of the cache batch size, then broadcast cache, but the impl for broadcasting attn, so for now, I'm just skipping this multiple draw idea. you could also have grouped queries then mask, but you'd need a proper kernel. either case, i think you need a custom kernel, but maybe there's a simpler way? for now assert draws_per_action_chunk=1, and we can add this later if we want to do multiple draws per action chunk. it's probably not that bad to implement it
     def loss_fn(model_state: nnx.State, batch: Batch):
 
         model: VLA = nnx.merge(state.model_graph, model_state)
@@ -60,21 +61,19 @@ def train_step(state: TrainState, config: TrainConfig, batch: Batch):
         noise = rearrange(noise, "b d h a -> (b d) h a")
         t = rearrange(t, "b d 1 1 -> (b d) 1 1")
         x_t = noise * t + (1 - t) * repeat(x, "b h a -> (b d) h a", d=config.draws_per_action_chunk)
-        target = noise - x
+        target_velocity = noise - x
 
-        output = model.run_action_head(cache=cache, action_t=x_t, traj_time=t)
-        # TODO: @Honyant: I'd like to have multiple draws of the noise per action so that we can reuse the same state/img prefix encoding for multiple action predictions. This emperically, as demonstrated by https://abc.bot/, improves training loss/gpu hour in their setup.
-        # you could flatten dims, and in the action head, check that batch size must be a multiple of the cache batch size, then broadcast cache, but the impl for broadcasting attn, so for now, I'm just skipping this multiple draw idea. you could also have grouped queries then mask, but you'd need a proper kernel. either case, i think you need a custom kernel, but maybe there's a simpler way? for now assert draws_per_action_chunk=1, and we can add this later if we want to do multiple draws per action chunk. it's probably not that bad to implement it
-        loss = jnp.mean((output - target) ** 2)
+        pred_velocity = model.run_action_head(cache=cache, action_t=x_t, traj_time=t)
+        loss = jnp.mean((pred_velocity - target_velocity) ** 2)
         return loss
 
-    value, grads = jax.value_and_grad(loss_fn)(state.model_state, batch)
+    loss, grads = jax.value_and_grad(loss_fn)(state.model_state, batch)
     updates, new_optimizer_state = state.optimizer.update(grads, state.optimizer_state, state.model_state)
 
     new_model_state = optax.apply_updates(state.model_state, updates)
     new_state = dataclasses.replace(state, model_state=new_model_state, optimizer_state=new_optimizer_state, key=key, step=state.step + 1)
 
-    info = {"loss": value, "step": state.step}
+    info = {"loss": loss, "step": state.step}
     return new_state, info
 
 
