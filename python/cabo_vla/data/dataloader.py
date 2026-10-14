@@ -499,7 +499,8 @@ class Dataloader:
             if action_count < self._action_horizon:
                 action_tensor = jnp.pad(
                     action_tensor,
-                    ((0, self._action_horizon - action_count), (0, 0)),
+                    ((0, self._action_horizon - action_count),)
+                    + ((0, 0),) * (action_tensor.ndim - 1),
                     mode="edge"
                     if self._padding_type == PaddingType.REPEAT_LAST
                     else "constant",
