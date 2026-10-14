@@ -59,7 +59,7 @@ class VLA(nnx.Module):
         return jnp.concatenate([jnp.cos(thetas), jnp.sin(thetas)], axis=-1)
 
     def encode_state_imgs(
-        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch State"] 
+        self, imgs: Float[jax.Array, "Batch Camera Channel Height Width"], state: Float[jax.Array, "Batch State"], time: Float[jax.Array, " Batch"]
     ):  # pi 0 style state
         # the attention mask is structured in a way to allow for caching the encoding of the state/img prefix and reuse the same intermediate tokens for the action decoding
         B, CA, C, H, W = imgs.shape
