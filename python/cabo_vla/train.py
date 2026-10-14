@@ -63,7 +63,7 @@ def train_step(state: TrainState, config: TrainConfig, batch: Batch):
         x_t = noise * t + (1 - t) * repeat(x, "b h a -> (b d) h a", d=config.draws_per_action_chunk)
         target_velocity = noise - x
 
-        pred_velocity = model.run_action_head(cache=cache, action_t=x_t, traj_time=t)
+        pred_velocity = model.run_action_head(cache=cache, action_t=x_t, traj_time=t[:, 0, 0])
         loss = jnp.mean((pred_velocity - target_velocity) ** 2)
         return loss
 
