@@ -30,7 +30,7 @@ class PaddingType(Enum):
 @struct.dataclass
 class Batch:
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str] = struct.field(pytree_node=False)
+    instruction: list[str] | None = struct.field(pytree_node=False)
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
     timestamp: Float[jax.Array, "Batch"]
