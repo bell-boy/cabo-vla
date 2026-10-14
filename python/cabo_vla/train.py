@@ -1,16 +1,18 @@
 import dataclasses
 import functools
 import os
+from pathlib import Path
 
 import flax.nnx as nnx
 import jax
 import optax
 from einops import rearrange, repeat
 from flax import struct
+from huggingface_hub import snapshot_download
 from jax import numpy as jnp
 
 from cabo_vla.config import VLAConfig
-from cabo_vla.data.dataloader import Batch
+from cabo_vla.data.dataloader import Batch, Dataloader, NormalizationType
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.models.pi0 import VLA
 
@@ -21,6 +23,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 @struct.dataclass
 class TrainConfig:
     vla: VLAConfig
+    dataset_repo: str = "lerobot/libero"
     learning_rate: float = 1e-4
     batch_size: int = 32
     num_epochs: int = 10
@@ -78,9 +81,9 @@ def train_step(state: TrainState, config: TrainConfig, batch: Batch):
 
 
 def main():
-    vla_config = VLAConfig()
+    vla_config = VLAConfig(state_size=8, action_size=7)  # LIBERO: 8-dim observation.state, 7-dim action
     train_config = TrainConfig(vla=vla_config)
-    init_key, data_key, train_key = jax.random.split(jax.random.key(train_config.seed), 3)
+    init_key, train_key = jax.random.split(jax.random.key(train_config.seed), 2)
 
     vla = VLA(vla_config, rngs=nnx.Rngs(init_key))
     load_hf_vit(vla.ViT, repo="google/vit-base-patch16-224")
@@ -93,17 +96,23 @@ def main():
     optimizer_state = optimizer.init(state)
 
     train_state = TrainState(model_graph=graphdef, model_state=state, optimizer=optimizer, optimizer_state=optimizer_state, key=train_key)
-    data_rngs = nnx.Rngs(data_key)  # only used outside jit, for the mock batches
+
+    train_loader = Dataloader(
+        Path(snapshot_download(train_config.dataset_repo, repo_type="dataset")),
+        resolution=(vla_config.vit.input_size, vla_config.vit.input_size),
+        batch_size=train_config.batch_size,
+        action_horizon=vla_config.action_chunk_size,
+        observation_features=["observation.images.image", "observation.images.image2"],
+        action_features=[("action", NormalizationType.QUANTILE)],
+        prio_features=[("observation.state", NormalizationType.QUANTILE)],
+        observation_range=(-1.0, 1.0),  # google/vit-base-patch16-224 expects pixels in [-1, 1]
+        seed=train_config.seed,
+    )
 
     for epoch in range(train_config.num_epochs):
-        for step in range(100):
-            batch = Batch(
-                observations=jax.random.normal(data_rngs(), (train_config.batch_size, 2, 3, 224, 224)),
-                instruction=None,
-                prio=jax.random.normal(data_rngs(), (train_config.batch_size, 32)),
-                action=jax.random.normal(data_rngs(), (train_config.batch_size, train_config.vla.action_chunk_size, train_config.vla.action_size)),
-                timestamp=jax.random.uniform(data_rngs(), (train_config.batch_size, 1)),
-            )
+        for step, batch in enumerate(train_loader):
+            # instruction is a static (non-pytree) field, so a fresh list of strings every step would force a retrace; the model doesn't read it yet
+            batch = dataclasses.replace(batch, instruction=None)
             train_state, info = train_step(train_state, train_config, batch)
             print(f"Epoch {epoch}, Step {step}, Loss: {info['loss']}")
 

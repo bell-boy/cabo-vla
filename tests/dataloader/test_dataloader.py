@@ -243,6 +243,7 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
     np.testing.assert_array_equal(np.concatenate([batch.timestamp for batch in batches]), EXPECTED_TIMESTAMPS)
     for batch in batches:
         assert batch.action.dtype == np.float32
+        assert batch.timestamp.dtype == np.float32
         assert batch.prio.dtype == np.float32
         assert batch.timestamp.dtype == np.float32
         assert batch.timestamp.shape == (len(batch.instruction),)
