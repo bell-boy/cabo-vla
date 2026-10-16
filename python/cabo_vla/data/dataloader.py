@@ -1,6 +1,6 @@
 import json
 import random
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from flax import struct
-from jaxtyping import Float
+from jaxtyping import Float, Int
 from PIL import Image, ImageOps
 
 
@@ -30,7 +30,7 @@ class PaddingType(Enum):
 @struct.dataclass
 class Batch:
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str] | None = struct.field(pytree_node=False)
+    instruction: list[Int[jax.Array, " seq"]]
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
     timestamp: Float[jax.Array, "Batch"]
@@ -85,6 +85,35 @@ class _Episode:
     data_to_index: int
     video_metadata: list[_EpisodeVideoMeta]
     episode_index: int
+
+
+@dataclass(frozen=True)
+class DataloaderConfig:
+    path: Path
+    resolution: tuple[int, int]
+    batch_size: int
+    action_horizon: int
+    observation_features: tuple[str, ...]
+    action_features: tuple[tuple[str, NormalizationType], ...]
+    prio_features: tuple[tuple[str, NormalizationType], ...]
+    tokenizer: Callable[[str], Int[jax.Array, " seq"]]
+    seq_len: int
+    pad_token_id: int
+    observation_range: tuple[float, float] = (0.0, 1.0)
+    padding_type: PaddingType = PaddingType.REPEAT_LAST
+    dtype: jax.typing.DTypeLike = jnp.float32
+    split: str | tuple[int, ...] = "train"
+    shuffle: bool = True
+    seed: int = 429
+    episode_indices: tuple[int, ...] | None = None
+
+
+@dataclass
+class DataloaderState:
+    config: DataloaderConfig
+    rng_state: tuple
+    order_buffer: list[int]
+    current_position: int
 
 
 def _iter_episodes(path: Path, video_features: list[str], batch_size: int = 1024) -> Iterator[_Episode]:
@@ -259,31 +288,30 @@ def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stat
 class Dataloader:
     def __init__(
         self,
-        path: Path,
+        config: DataloaderConfig,
         *,
-        resolution: tuple[int, int],
-        batch_size: int,
-        action_horizon: int,
-        observation_features: list[str],
-        action_features: list[tuple[str, NormalizationType]],
-        prio_features: list[tuple[str, NormalizationType]],
-        observation_range: tuple[float, float] = (0.0, 1.0),
-        padding_type: PaddingType = PaddingType.REPEAT_LAST,
-        dtype: jax.typing.DTypeLike = jnp.float32,
-        split: str = "train",
-        shuffle: bool = True,
-        seed: int = 429,
+        rng_state: tuple | None = None,
+        order_buffer: list[int] | None = None,
+        current_position: int = 0,
     ):
-        self._batch_size = batch_size
-        self._action_horizon = action_horizon
-        self._path = path
-        self._rng = random.Random(seed)
-        self._shuffle = shuffle
-        self._dtype = dtype
-        self._resolution = resolution
-        self._observation_range = observation_range
-        self._padding_type = padding_type
-        if not jnp.issubdtype(dtype, jnp.floating):
+        if config.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if config.seq_len <= 0:
+            raise ValueError("seq_len must be positive")
+        self._config = config
+        self._tokenizer = config.tokenizer
+        self._batch_size = config.batch_size
+        self._action_horizon = config.action_horizon
+        self._path = config.path
+        self._rng = random.Random(config.seed)
+        if rng_state is not None:
+            self._rng.setstate(rng_state)
+        self._shuffle = config.shuffle
+        self._dtype = config.dtype
+        self._resolution = config.resolution
+        self._observation_range = config.observation_range
+        self._padding_type = config.padding_type
+        if not jnp.issubdtype(config.dtype, jnp.floating):
             raise ValueError("dtype must be floating point for normalized observations")
 
         info_file = self._path / "meta" / "info.json"
@@ -300,7 +328,7 @@ class Dataloader:
             raise RuntimeError('Expected "features" to be a JSON dict.')
 
         self._observation_features: list[_DatasetFeature] = []
-        for feature_name in observation_features:
+        for feature_name in config.observation_features:
             if not isinstance(feature_dict := features.get(feature_name), dict):
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
             feature = _parse_dataset_feature(feature_name, feature_dict, NormalizationType.NONE, {})
@@ -309,14 +337,14 @@ class Dataloader:
             self._observation_features.append(feature)
 
         stats = {}
-        if any(mode != NormalizationType.NONE for _, mode in action_features + prio_features):
+        if any(mode != NormalizationType.NONE for _, mode in config.action_features + config.prio_features):
             with open(self._path / "meta" / "stats.json") as f:
                 stats = json.load(f)
             if not isinstance(stats, dict):
                 raise ValueError("Expected meta/stats.json to contain a JSON dict.")
 
         self._action_features: list[_DatasetFeature] = []
-        for feature_name, mode in action_features:
+        for feature_name, mode in config.action_features:
             if not isinstance(feature_dict := features.get(feature_name), dict):
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
             feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
@@ -325,7 +353,7 @@ class Dataloader:
             self._action_features.append(feature)
 
         self._prio_features: list[_DatasetFeature] = []
-        for feature_name, mode in prio_features:
+        for feature_name, mode in config.prio_features:
             if not isinstance(feature_dict := features.get(feature_name), dict):
                 raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
             feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
@@ -333,28 +361,41 @@ class Dataloader:
                 raise RuntimeError(f"Prio feature {feature_name} has unsupported dtype {feature.dtype}")
             self._prio_features.append(feature)
 
-        if action_horizon <= 0:
+        if config.action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
 
-        if not isinstance(splits := info.get("splits"), dict):
-            raise RuntimeError('Expected "splits" to be a JSON dict.')
-        if not isinstance(episode_range := splits.get(split), str):
-            raise RuntimeError(f"Failed to find split {split!r} in dataset.")
-        try:
-            episode_from, episode_to = map(int, episode_range.split(":"))
-        except ValueError as error:
-            raise RuntimeError(f"Expected an episode range 'start:end' for split {split!r}.") from error
-        if not 0 <= episode_from <= episode_to:
-            raise RuntimeError(f"Invalid episode range for split {split!r}.")
+        split_episodes: range | set[int]
+        split = config.split
+        if isinstance(split, str):
+            if not isinstance(splits := info.get("splits"), dict):
+                raise RuntimeError('Expected "splits" to be a JSON dict.')
+            if not isinstance(episode_range := splits.get(split), str):
+                raise RuntimeError(f"Failed to find split {split!r} in dataset.")
+            try:
+                episode_from, episode_to = map(int, episode_range.split(":"))
+            except ValueError as error:
+                raise RuntimeError(f"Expected an episode range 'start:end' for split {split!r}.") from error
+            if not 0 <= episode_from <= episode_to:
+                raise RuntimeError(f"Invalid episode range for split {split!r}.")
+            split_episodes = range(episode_from, episode_to)
+        else:
+            split_episodes = set(split)
 
+        selected_episodes = set(config.episode_indices) if config.episode_indices is not None else None
         self._episodes = [
             episode
             for episode in _iter_episodes(
                 self._path,
                 [feature.name for feature in self._observation_features if feature.dtype == "video"],
             )
-            if episode_from <= episode.episode_index < episode_to
+            if episode.episode_index in split_episodes
         ]
+        if not isinstance(split, str) and split_episodes != {ep.episode_index for ep in self._episodes}:
+            raise ValueError("Requested episodes must exist in the dataset.")
+        if selected_episodes is not None:
+            self._episodes = [ep for ep in self._episodes if ep.episode_index in selected_episodes]
+        if selected_episodes is not None and selected_episodes != {ep.episode_index for ep in self._episodes}:
+            raise ValueError("Requested episodes must exist in the selected split.")
 
         if not isinstance(data_path_template := info.get("data_path"), str):
             raise RuntimeError("Expected string data_path.")
@@ -367,23 +408,63 @@ class Dataloader:
 
         self._tasks: list[str] = pq.read_table(self._path / "meta" / "tasks.parquet").to_pandas().index.tolist()
 
-        self._order_buffer = [
-            idx for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index) for idx in range(episode.data_from_index, episode.data_to_index)
-        ]
+        if order_buffer is None:
+            self._order_buffer = [
+                idx for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index) for idx in range(episode.data_from_index, episode.data_to_index)
+            ]
+            if self._shuffle:
+                self._rng.shuffle(self._order_buffer)
+        else:
+            self._order_buffer = order_buffer.copy()
+        if not 0 <= current_position <= len(self._order_buffer):
+            raise ValueError("current_position must be within the order buffer")
+        self.current_position = current_position
 
-    def __iter__(self):
-        if self._shuffle:
-            self._rng.shuffle(self._order_buffer)
-        for start in range(0, len(self._order_buffer), self._batch_size):
+    def get_state(self) -> DataloaderState:
+        return DataloaderState(
+            config=self._config,
+            rng_state=self._rng.getstate(),
+            order_buffer=self._order_buffer.copy(),
+            current_position=self.current_position,
+        )
+
+    @classmethod
+    def from_state(cls, state: DataloaderState) -> "Dataloader":
+        return cls(
+            state.config,
+            rng_state=state.rng_state,
+            order_buffer=state.order_buffer,
+            current_position=state.current_position,
+        )
+
+    def __len__(self) -> int:
+        return (len(self._order_buffer) + self._batch_size - 1) // self._batch_size
+
+    def __iter__(self) -> Iterator[Batch]:
+        while self.current_position < len(self._order_buffer):
+            start = self.current_position
             indices = self._order_buffer[start : start + self._batch_size]
             samples = [self._fetch_single(idx) for idx in indices]
-            yield Batch(
+            batch = Batch(
                 observations=jnp.stack([s[0] for s in samples], axis=0),
-                instruction=[s[3] for s in samples],
+                instruction=[self._tokenize_instruction(s[3]) for s in samples],
                 action=jnp.stack([s[1] for s in samples], axis=0),
                 prio=jnp.stack([s[2] for s in samples], axis=0),
                 timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
             )
+            self.current_position += len(indices)
+            yield batch
+        self.current_position = 0
+        if self._shuffle:
+            self._rng.shuffle(self._order_buffer)
+
+    def _tokenize_instruction(self, text: str) -> Int[jax.Array, " seq"]:
+        tokens = self._tokenizer(text)[: self._config.seq_len]
+        return jnp.pad(
+            tokens,
+            (0, self._config.seq_len - tokens.shape[0]),
+            constant_values=self._config.pad_token_id,
+        )
 
     def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
         episode: _Episode | None = None

@@ -1,4 +1,5 @@
 import json
+import pickle
 from io import BytesIO
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from PIL import Image
 
 from cabo_vla.data.dataloader import (
     Dataloader,
+    DataloaderConfig,
     NormalizationType,
     PaddingType,
 )
@@ -20,6 +22,13 @@ from cabo_vla.data.dataloader import (
 EPISODE_LENGTHS = (4, 3)
 TASKS = ("pick up", "put down")
 BATCH_SIZE = 2
+SEQ_LEN = 6
+PAD_TOKEN_ID = 0
+EXPECTED_TOKENS = {
+    "pick up": [112, 105, 99, 107, 32, 117],
+    "put down": [112, 117, 116, 32, 100, 111],
+    "stack": [115, 116, 97, 99, 107, PAD_TOKEN_ID],
+}
 HORIZON = 3
 ROW_GROUP_SIZE = 2
 WIDTH, HEIGHT, CHANNELS = 8, 4, 3
@@ -78,9 +87,14 @@ def write_video(path: Path, frames: np.ndarray) -> None:
             container.mux(packet)
 
 
-def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
+def write_tiny_dataset(
+    root: Path,
+    *,
+    episode_lengths: tuple[int, ...] = EPISODE_LENGTHS,
+    tasks: tuple[str, ...] = TASKS,
+) -> dict[str, np.ndarray]:
     """Write real files and retain their source arrays as expected-value inputs."""
-    frame_count = sum(EPISODE_LENGTHS)
+    frame_count = sum(episode_lengths)
     frame_ids = np.arange(frame_count)
     source = {name: (base + FRAME_STRIDE * frame_ids[:, None] + np.arange(width)).astype(np.float32) for name, (base, width) in NUMERIC_FEATURES.items()}
     for name, base in CAMERA_BASES.items():
@@ -111,17 +125,17 @@ def write_tiny_dataset(root: Path) -> dict[str, np.ndarray]:
             {
                 "codebase_version": "v3.0",
                 "features": features,
-                "splits": {"train": f"0:{len(EPISODE_LENGTHS)}"},
+                "splits": {"train": f"0:{len(episode_lengths)}"},
                 "data_path": DATA_PATH,
                 "video_path": VIDEO_PATH,
             }
         )
     )
-    pd.DataFrame({"task_index": range(len(TASKS))}, index=np.asarray(TASKS)).to_parquet(root / "meta/tasks.parquet")
+    pd.DataFrame({"task_index": range(len(tasks))}, index=np.asarray(tasks)).to_parquet(root / "meta/tasks.parquet")
 
     episodes, task_indices, timestamps = [], [], []
     start = 0
-    for episode_index, length in enumerate(EPISODE_LENGTHS):
+    for episode_index, length in enumerate(episode_lengths):
         stop = start + length
         episodes.append(
             {
@@ -177,6 +191,10 @@ def tiny_dataset(tmp_path):
     return tmp_path, write_tiny_dataset(tmp_path)
 
 
+def tokenize(text: str):
+    return jnp.asarray([ord(character) for character in text], dtype=jnp.int32)
+
+
 def make_loader(
     path,
     *,
@@ -185,20 +203,114 @@ def make_loader(
     cameras=(),
     dtype=jnp.float32,
     action_horizon=HORIZON,
+    shuffle=False,
     **kwargs,
 ):
     return Dataloader(
-        path,
-        resolution=(WIDTH, HEIGHT),
-        batch_size=BATCH_SIZE,
-        action_horizon=action_horizon,
-        observation_features=list(cameras),
-        action_features=[(name, NormalizationType.NONE) for name in actions],
-        prio_features=[(name, NormalizationType.NONE) for name in states],
-        shuffle=False,
-        dtype=dtype,
-        **kwargs,
+        DataloaderConfig(
+            path,
+            resolution=(WIDTH, HEIGHT),
+            batch_size=BATCH_SIZE,
+            action_horizon=action_horizon,
+            observation_features=tuple(cameras),
+            action_features=tuple((name, NormalizationType.NONE) for name in actions),
+            prio_features=tuple((name, NormalizationType.NONE) for name in states),
+            tokenizer=tokenize,
+            seq_len=SEQ_LEN,
+            pad_token_id=PAD_TOKEN_ID,
+            shuffle=shuffle,
+            dtype=dtype,
+            **kwargs,
+        )
     )
+
+
+@pytest.mark.parametrize("shuffle", [False, True])
+@pytest.mark.parametrize(
+    "consumed_batches,expected_position",
+    [
+        pytest.param(0, 0, id="before-first-batch"),
+        pytest.param(1, 2, id="mid-epoch"),
+        pytest.param(3, 6, id="before-partial-batch"),
+        pytest.param(4, 7, id="after-partial-batch"),
+    ],
+)
+def test_state_round_trip_preserves_iteration(tiny_dataset, shuffle, consumed_batches, expected_position):
+    path, _ = tiny_dataset
+    loader = make_loader(
+        path,
+        actions=["action.arm"],
+        states=["state.joints"],
+        cameras=[IMAGE_CAMERA, VIDEO_CAMERA],
+        shuffle=shuffle,
+    )
+    iterator = iter(loader)
+    for _ in range(consumed_batches):
+        next(iterator)
+
+    state = pickle.loads(pickle.dumps(loader.get_state()))
+    assert state.current_position == expected_position
+    expected_epochs = [list(iterator), list(loader), list(loader)]
+    restored = Dataloader.from_state(state)
+    assert restored.get_state() == state
+    assert restored.current_position == expected_position
+
+    for expected_batches in expected_epochs:
+        actual_batches = list(restored)
+        assert len(actual_batches) == len(expected_batches)
+        for actual, expected in zip(actual_batches, expected_batches, strict=True):
+            for actual_tokens, expected_tokens in zip(actual.instruction, expected.instruction, strict=True):
+                np.testing.assert_array_equal(actual_tokens, expected_tokens)
+            for field in ("observations", "action", "prio", "timestamp"):
+                np.testing.assert_array_equal(getattr(actual, field), getattr(expected, field))
+
+
+@pytest.mark.parametrize(
+    "split,selected_frames",
+    [
+        pytest.param("train", [0, 1, 2, 3], id="train-label"),
+        pytest.param("val", [4, 5, 6], id="val-label"),
+        pytest.param((0, 2), [0, 1, 2, 3, 7, 8], id="skip-middle-episode"),
+        pytest.param((2, 0, 2), [0, 1, 2, 3, 7, 8], id="unordered-duplicates"),
+        pytest.param((), [], id="empty-selection"),
+    ],
+)
+def test_split_selects_episode_frames(tmp_path, split, selected_frames):
+    source = write_tiny_dataset(tmp_path, episode_lengths=(4, 3, 2), tasks=("pick up", "put down", "stack"))
+    info_path = tmp_path / "meta/info.json"
+    info = json.loads(info_path.read_text())
+    info["splits"] = {"train": "0:1", "val": "1:2"}
+    info_path.write_text(json.dumps(info))
+    batches = list(make_loader(tmp_path, actions=["action.arm"], states=["state.joints"], split=split))
+    if not selected_frames:
+        assert batches == []
+        return
+
+    windows = np.array(
+        [
+            [0, 1, 2],
+            [1, 2, 3],
+            [2, 3, 3],
+            [3, 3, 3],
+            [4, 5, 6],
+            [5, 6, 6],
+            [6, 6, 6],
+            [7, 8, 8],
+            [8, 8, 8],
+        ]
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([batch.prio for batch in batches]),
+        source["state.joints"][selected_frames],
+    )
+    np.testing.assert_array_equal(
+        np.concatenate([batch.action for batch in batches]),
+        source["action.arm"][windows[selected_frames]],
+    )
+    tasks = ["pick up"] * 4 + ["put down"] * 3 + ["stack"] * 2
+    instructions = [tokens for batch in batches for tokens in batch.instruction]
+    for tokens, index in zip(instructions, selected_frames, strict=True):
+        np.testing.assert_array_equal(tokens, EXPECTED_TOKENS[tasks[index]])
 
 
 @pytest.mark.parametrize(
@@ -239,11 +351,14 @@ def test_action_windows_and_numeric_feature_selection(tiny_dataset, actions, sta
     expected_states = np.concatenate([source[name][EXPECTED_STARTS] for name in states], axis=-1)
     np.testing.assert_array_equal(np.concatenate([batch.action for batch in batches]), expected_actions)
     np.testing.assert_array_equal(np.concatenate([batch.prio for batch in batches]), expected_states)
-    assert [task for batch in batches for task in batch.instruction] == EXPECTED_TASKS
+    instructions = [tokens for batch in batches for tokens in batch.instruction]
+    for tokens, task in zip(instructions, EXPECTED_TASKS, strict=True):
+        assert tokens.ndim == 1
+        assert jnp.issubdtype(tokens.dtype, jnp.integer)
+        np.testing.assert_array_equal(tokens, EXPECTED_TOKENS[task])
     np.testing.assert_array_equal(np.concatenate([batch.timestamp for batch in batches]), EXPECTED_TIMESTAMPS)
     for batch in batches:
         assert batch.action.dtype == np.float32
-        assert batch.timestamp.dtype == np.float32
         assert batch.prio.dtype == np.float32
         assert batch.timestamp.dtype == np.float32
         assert batch.timestamp.shape == (len(batch.instruction),)
@@ -313,22 +428,27 @@ def test_mixed_normalization_preserves_values_order_and_dtype(tiny_dataset, dtyp
         )
     )
     loader = Dataloader(
-        path,
-        resolution=(WIDTH, HEIGHT),
-        batch_size=BATCH_SIZE,
-        action_horizon=HORIZON,
-        observation_features=[],
-        action_features=[
-            ("action.gripper", NormalizationType.NONE),
-            ("action.arm", NormalizationType.MEANVAR),
-        ],
-        prio_features=[
-            ("state.joints", NormalizationType.QUANTILE),
-            ("state.force", NormalizationType.NONE),
-        ],
-        dtype=dtype,
-        shuffle=False,
-        padding_type=padding_type,
+        DataloaderConfig(
+            path,
+            resolution=(WIDTH, HEIGHT),
+            batch_size=BATCH_SIZE,
+            action_horizon=HORIZON,
+            observation_features=(),
+            action_features=(
+                ("action.gripper", NormalizationType.NONE),
+                ("action.arm", NormalizationType.MEANVAR),
+            ),
+            prio_features=(
+                ("state.joints", NormalizationType.QUANTILE),
+                ("state.force", NormalizationType.NONE),
+            ),
+            dtype=dtype,
+            shuffle=False,
+            padding_type=padding_type,
+            tokenizer=tokenize,
+            seq_len=SEQ_LEN,
+            pad_token_id=PAD_TOKEN_ID,
+        )
     )
     batches = list(loader)
     expected_actions = np.concatenate(
@@ -370,14 +490,19 @@ def test_zero_normalization_scale_uses_unit_divisor(tiny_dataset, mode, stats):
     path, source = tiny_dataset
     (path / "meta/stats.json").write_text(json.dumps({"action.gripper": stats}))
     loader = Dataloader(
-        path,
-        resolution=(WIDTH, HEIGHT),
-        batch_size=BATCH_SIZE,
-        action_horizon=HORIZON,
-        observation_features=[],
-        action_features=[("action.gripper", mode)],
-        prio_features=[],
-        shuffle=False,
+        DataloaderConfig(
+            path,
+            resolution=(WIDTH, HEIGHT),
+            batch_size=BATCH_SIZE,
+            action_horizon=HORIZON,
+            observation_features=(),
+            action_features=(("action.gripper", mode),),
+            prio_features=(),
+            tokenizer=tokenize,
+            seq_len=SEQ_LEN,
+            pad_token_id=PAD_TOKEN_ID,
+            shuffle=False,
+        )
     )
     actual = np.concatenate([batch.action for batch in loader])
     offset_key = "mean" if mode == NormalizationType.MEANVAR else "q01"

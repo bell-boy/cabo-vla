@@ -12,7 +12,7 @@ from huggingface_hub import snapshot_download
 from jax import numpy as jnp
 
 from cabo_vla.config import VLAConfig
-from cabo_vla.data.dataloader import Batch, Dataloader, NormalizationType
+from cabo_vla.data.dataloader import Batch, Dataloader, DataloaderConfig, NormalizationType
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.models.pi0 import VLA
 
@@ -80,6 +80,10 @@ def train_step(state: TrainState, config: TrainConfig, batch: Batch):
     return new_state, info
 
 
+def ignore_instruction(_: str) -> jax.Array:
+    return jnp.empty((0,), dtype=jnp.int32)
+
+
 def main():
     vla_config = VLAConfig(state_size=8, action_size=7)  # LIBERO: 8-dim observation.state, 7-dim action
     train_config = TrainConfig(vla=vla_config)
@@ -98,21 +102,24 @@ def main():
     train_state = TrainState(model_graph=graphdef, model_state=state, optimizer=optimizer, optimizer_state=optimizer_state, key=train_key)
 
     train_loader = Dataloader(
-        Path(snapshot_download(train_config.dataset_repo, repo_type="dataset")),
-        resolution=(vla_config.vit.input_size, vla_config.vit.input_size),
-        batch_size=train_config.batch_size,
-        action_horizon=vla_config.action_chunk_size,
-        observation_features=["observation.images.image", "observation.images.image2"],
-        action_features=[("action", NormalizationType.QUANTILE)],
-        prio_features=[("observation.state", NormalizationType.QUANTILE)],
-        observation_range=(-1.0, 1.0),  # google/vit-base-patch16-224 expects pixels in [-1, 1]
-        seed=train_config.seed,
+        DataloaderConfig(
+            Path(snapshot_download(train_config.dataset_repo, repo_type="dataset")),
+            resolution=(vla_config.vit.input_size, vla_config.vit.input_size),
+            batch_size=train_config.batch_size,
+            action_horizon=vla_config.action_chunk_size,
+            observation_features=("observation.images.image", "observation.images.image2"),
+            action_features=(("action", NormalizationType.QUANTILE),),
+            prio_features=(("observation.state", NormalizationType.QUANTILE),),
+            tokenizer=ignore_instruction,
+            seq_len=1,
+            pad_token_id=0,
+            observation_range=(-1.0, 1.0),  # google/vit-base-patch16-224 expects pixels in [-1, 1]
+            seed=train_config.seed,
+        )
     )
 
     for epoch in range(train_config.num_epochs):
         for step, batch in enumerate(train_loader):
-            # instruction is a static (non-pytree) field, so a fresh list of strings every step would force a retrace; the model doesn't read it yet
-            batch = dataclasses.replace(batch, instruction=None)
             train_state, info = train_step(train_state, train_config, batch)
             print(f"Epoch {epoch}, Step {step}, Loss: {info['loss']}")
 
