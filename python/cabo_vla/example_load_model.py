@@ -20,7 +20,7 @@ def test_vit():
 
     @jax.jit
     def forward(state, x):
-        return nnx.merge(graphdef, state)(x)
+        return jax.vmap(nnx.merge(graphdef, state))(x)
 
     output = forward(state, sample_input)
     print(f"Output shape: {output.shape}")
