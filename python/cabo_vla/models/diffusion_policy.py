@@ -29,7 +29,6 @@ class DiffusionPolicy(nnx.Module):
         self.vision_encoder = vision_encoder
         self._action_dim = action_dim
         self._action_horizon = action_horizon
-        self._num_cameras = num_cameras
         self._d_model = d_model
         self._observation_proj = nnx.Linear(vision_encoder.cfg.dim, d_model, rngs=rngs)
         self._camera_embed = nnx.Param(0.02 * jax.random.normal(rngs.params(), (num_cameras, 1, d_model)))
@@ -42,11 +41,6 @@ class DiffusionPolicy(nnx.Module):
         self._action_out = nnx.Linear(d_model, action_dim, rngs=rngs)
 
     def encode_images(self, observations: Float[jax.Array, "Batch Camera Channel Height Width"]) -> Float[jax.Array, "Batch Camera Patch Dim"]:
-        if observations.ndim != 5 or observations.shape[1] != self._num_cameras:
-            raise ValueError("Expected observations with shape (batch, num_cameras, channels, height, width).")
-        image_size = self.vision_encoder.cfg.input_size
-        if observations.shape[2:] != (3, image_size, image_size):
-            raise ValueError(f"Expected RGB observations with resolution {image_size}x{image_size}.")
         return jax.vmap(jax.vmap(self.vision_encoder))(observations)
 
     def _project_features(self, features: jax.Array) -> jax.Array:
@@ -58,8 +52,6 @@ class DiffusionPolicy(nnx.Module):
 
     def _embed_actions(self, noisy_actions: jax.Array, time: jax.Array) -> jax.Array:
         batch_size = noisy_actions.shape[0]
-        if noisy_actions.shape[1:] != (self._action_horizon, self._action_dim):
-            raise ValueError("Expected actions with shape (batch, action_horizon, action_dim).")
         time = jnp.broadcast_to(time, (batch_size,))
         frequencies = jnp.exp(-jnp.log(10_000.0) * jnp.arange(self._d_model // 2) / max(self._d_model // 2 - 1, 1))
         angles = time[:, None] * frequencies[None, :] * (2 * jnp.pi)
@@ -118,8 +110,6 @@ class DiffusionPolicy(nnx.Module):
         shape = (observations.shape[0], self._action_horizon, self._action_dim)
         if noise is None:
             noise = jax.random.normal(rng, shape)
-        elif noise.shape != shape:
-            raise ValueError(f"Expected initial noise with shape {shape}.")
         noise = noise.astype(jnp.float32)
         dt = 1.0 / num_steps
 
