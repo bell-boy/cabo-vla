@@ -1,128 +1,121 @@
-import dataclasses
 import functools
-import os
+import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
+from typing import NamedTuple, Protocol
 
-import flax.nnx as nnx
 import jax
 import optax
-from einops import rearrange, repeat
-from flax import struct
-from huggingface_hub import snapshot_download
-from jax import numpy as jnp
+from flax import nnx
+from tqdm import tqdm, trange
 
-from cabo_vla.config import VLAConfig
-from cabo_vla.data.dataloader import Batch, Dataloader, DataloaderConfig, NormalizationType
-from cabo_vla.load_model import load_hf_vit
-from cabo_vla.models.pi0 import VLA
-
-jax.config.update("jax_compilation_cache_dir", os.path.expanduser("~/.cache/jax"))
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+from cabo_vla.data.dataloader import (
+    Batch,
+    Dataloader,
+    DataloaderConfig,
+    DataloaderState,
+)
 
 
-@struct.dataclass
+class LossFn(Protocol):
+    def __call__(
+        self,
+        params: nnx.State,
+        frozen_state: nnx.State,
+        graphdef: nnx.GraphDef,
+        batch: Batch,
+        *,
+        key: jax.Array,
+    ) -> jax.Array: ...
+
+
+@dataclass
 class TrainConfig:
-    vla: VLAConfig
-    dataset_repo: str = "lerobot/libero"
-    learning_rate: float = 1e-4
-    batch_size: int = 32
-    num_epochs: int = 10
-    seed: int = 42
-    draws_per_action_chunk: int = 1  # https://abc.bot/
+    data_config: DataloaderConfig
+    log_file: Path
+    model_type: Callable[..., nnx.Module]
+    model_kwargs: dict
+    optimizer: optax.GradientTransformation
+    loss_fn: LossFn
+    seed: int = 0
+    n_epochs: int = 1
+    frozen_weight_filter: nnx.filterlib.Filter = lambda _, __: False
 
 
-@struct.dataclass
+@dataclass
 class TrainState:
-    model_graph: nnx.GraphDef
-    model_state: nnx.State
-    optimizer: optax.GradientTransformation = struct.field(pytree_node=False)
+    graphdef: nnx.GraphDef
+    params: nnx.State
+    frozen_state: nnx.State
+    optimizer_state: optax.OptState
+    dataloader_state: DataloaderState
+    key: jax.Array
+
+
+class TrainStepOutput(NamedTuple):
+    loss: jax.Array
+    params: nnx.State
     optimizer_state: optax.OptState
     key: jax.Array
-    step: int = 0
 
 
-@functools.partial(jax.jit, static_argnames="config", donate_argnums=(0,))
-def train_step(state: TrainState, config: TrainConfig, batch: Batch):
-    key, noise_key, t_key = jax.random.split(state.key, 3)
+def train(config: TrainConfig):
+    key = jax.random.key(config.seed)
+    key, _, model_key = jax.random.split(key, 3)
+    logging.basicConfig(filename=config.log_file, level=logging.INFO)
+    logger = logging.getLogger(__name__)
 
-    # TODO: @Honyant: I'd like to have multiple draws of the noise per action so that we can reuse the same state/img prefix encoding for multiple action predictions. This emperically, as demonstrated by https://abc.bot/, improves training loss/gpu hour in their setup.
-    # you could flatten dims, and in the action head, check that batch size must be a multiple of the cache batch size, then broadcast cache, but the impl for broadcasting attn, so for now, I'm just skipping this multiple draw idea. you could also have grouped queries then mask, but you'd need a proper kernel. either case, i think you need a custom kernel, but maybe there's a simpler way? for now assert draws_per_action_chunk=1, and we can add this later if we want to do multiple draws per action chunk. it's probably not that bad to implement it
-    def loss_fn(model_state: nnx.State, batch: Batch):
+    logger.info(f"Loading data at {config.data_config.path}")
 
-        model: VLA = nnx.merge(state.model_graph, model_state)
-        _, cache = model.encode_state_imgs(imgs=batch.observations, state=batch.prio, time=batch.timestamp)  # B N D
+    dataloader = Dataloader(config.data_config)
 
-        x = batch.action
-        assert config.draws_per_action_chunk == 1, "for now, we only support draws_per_action_chunk=1, see comment in train.py for more details"
+    @functools.partial(jax.jit, static_argnums=0, donate_argnums=1)
+    def train_step(graphdef, params, frozen_state, optimizer_state, batch, key) -> TrainStepOutput:
+        key, loss_key = jax.random.split(key)
+        loss, grad = jax.value_and_grad(config.loss_fn)(params, frozen_state, graphdef, batch, key=loss_key)
+        updates, optimizer_state = config.optimizer.update(grad, optimizer_state, params=params)
+        new_params: nnx.State = optax.apply_updates(params, updates)  # type: ignore
+        return TrainStepOutput(loss, new_params, optimizer_state, key)
 
-        noise = jax.random.normal(
-            noise_key, shape=(x.shape[0], config.draws_per_action_chunk, config.vla.action_chunk_size, config.vla.action_size), dtype=jnp.float32
-        )  # batch draws horizon actions
-        t = jax.random.uniform(
-            t_key, shape=(x.shape[0], config.draws_per_action_chunk, 1, 1), minval=0, maxval=1
-        )  # batch draws 1 1 (because we denoise each chunk at the same time)
-        noise = rearrange(noise, "b d h a -> (b d) h a")
-        t = rearrange(t, "b d 1 1 -> (b d) 1 1")
-        x_t = noise * t + (1 - t) * repeat(x, "b h a -> (b d) h a", d=config.draws_per_action_chunk)
-        target_velocity = noise - x
+    model = config.model_type(**config.model_kwargs, rngs=nnx.Rngs(params=model_key))
+    graphdef, params, frozen_state = nnx.split(model, nnx.All(nnx.Param, nnx.Not(config.frozen_weight_filter)), ...)
+    optimizer_state = config.optimizer.init(params)
 
-        pred_velocity = model.run_action_head(cache=cache, action_t=x_t, traj_time=t[:, 0, 0])
-        loss = jnp.mean((pred_velocity - target_velocity) ** 2)
-        return loss
-
-    loss, grads = jax.value_and_grad(loss_fn)(state.model_state, batch)
-    updates, new_optimizer_state = state.optimizer.update(grads, state.optimizer_state, state.model_state)
-
-    new_model_state = optax.apply_updates(state.model_state, updates)
-    new_state = dataclasses.replace(state, model_state=new_model_state, optimizer_state=new_optimizer_state, key=key, step=state.step + 1)
-
-    info = {"loss": loss, "step": state.step}
-    return new_state, info
-
-
-def ignore_instruction(_: str) -> jax.Array:
-    return jnp.empty((0,), dtype=jnp.int32)
-
-
-def main():
-    vla_config = VLAConfig(state_size=8, action_size=7)  # LIBERO: 8-dim observation.state, 7-dim action
-    train_config = TrainConfig(vla=vla_config)
-    init_key, train_key = jax.random.split(jax.random.key(train_config.seed), 2)
-
-    vla = VLA(vla_config, rngs=nnx.Rngs(init_key))
-    load_hf_vit(vla.ViT, repo="google/vit-base-patch16-224")
-    for _, m in nnx.iter_modules(vla):
-        if isinstance(m, (nnx.Linear, nnx.Conv)):
-            m.dtype = jnp.bfloat16
-    graphdef, state = nnx.split(vla)
-
-    optimizer = optax.adam(learning_rate=train_config.learning_rate)
-    optimizer_state = optimizer.init(state)
-
-    train_state = TrainState(model_graph=graphdef, model_state=state, optimizer=optimizer, optimizer_state=optimizer_state, key=train_key)
-
-    train_loader = Dataloader(
-        DataloaderConfig(
-            Path(snapshot_download(train_config.dataset_repo, repo_type="dataset")),
-            resolution=(vla_config.vit.input_size, vla_config.vit.input_size),
-            batch_size=train_config.batch_size,
-            action_horizon=vla_config.action_chunk_size,
-            observation_features=("observation.images.image", "observation.images.image2"),
-            action_features=(("action", NormalizationType.QUANTILE),),
-            prio_features=(("observation.state", NormalizationType.QUANTILE),),
-            tokenizer=ignore_instruction,
-            seq_len=1,
-            pad_token_id=0,
-            observation_range=(-1.0, 1.0),  # google/vit-base-patch16-224 expects pixels in [-1, 1]
-            seed=train_config.seed,
-        )
+    state = TrainState(
+        graphdef=graphdef,
+        params=params,
+        frozen_state=frozen_state,
+        optimizer_state=optimizer_state,
+        dataloader_state=dataloader.get_state(),
+        key=key,
     )
 
-    for epoch in range(train_config.num_epochs):
-        for step, batch in enumerate(train_loader):
-            train_state, info = train_step(train_state, train_config, batch)
-            print(f"Epoch {epoch}, Step {step}, Loss: {info['loss']}")
+    for epoch in trange(config.n_epochs):
+        logger.info(f"Starting epoch {epoch + 1}/{config.n_epochs}")
+        for batch in tqdm(dataloader, leave=False):
+            train_output = train_step(
+                state.graphdef,
+                state.params,
+                frozen_state,
+                state.optimizer_state,
+                batch,
+                state.key,
+            )
+            state = TrainState(
+                graphdef=state.graphdef,
+                params=train_output.params,
+                frozen_state=frozen_state,
+                optimizer_state=train_output.optimizer_state,
+                dataloader_state=dataloader.get_state(),
+                key=train_output.key,
+            )
+            logger.info(f"Loss: {train_output.loss.item()}")
+    logger.info("Training complete.")
+    return state
 
 
 if __name__ == "__main__":
+    from cabo_vla.training_configs.pi0 import main
+
     main()
