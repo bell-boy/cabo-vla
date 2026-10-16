@@ -63,7 +63,7 @@ class VLA(nnx.Module):
         # the attention mask is structured in a way to allow for caching the encoding of the state/img prefix and reuse the same intermediate tokens for the action decoding
         B, CA, C, H, W = imgs.shape
         imgs = rearrange(imgs, "b c1 c2 h w -> (b c1) c2 h w")  # combine batch and camera dimensions
-        vit_tokens = self.img_proj(self.ViT(imgs))  # (b*c1, n, vlm_dim)
+        vit_tokens = self.img_proj(jax.vmap(self.ViT)(imgs))  # (b*c1, n, vlm_dim)
         vit_tokens = rearrange(vit_tokens, "(b c1) n d-> b (c1 n) d", c1=CA)
         state = self.state_proj(state)
         x = jnp.concatenate([vit_tokens, jnp.expand_dims(state, axis=1)], axis=1)
