@@ -30,7 +30,7 @@ class PaddingType(Enum):
 @struct.dataclass
 class Batch:
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[str] = struct.field(pytree_node=False)
+    instruction: list[str] | None = struct.field(pytree_node=False)
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
     timestamp: Float[jax.Array, "Batch"]
@@ -417,6 +417,13 @@ class Dataloader:
             raise RuntimeError(f"Expected integral task_id for frame {idx}.")
         task: str = self._tasks[task_id]
 
+        frame_timestamp = feature_row.get("timestamp")
+        if isinstance(frame_timestamp, list) and len(frame_timestamp) == 1:
+            frame_timestamp = frame_timestamp[0]
+        if not isinstance(frame_timestamp, (int, float)):
+            raise RuntimeError(f"Expected scalar timestamp for frame {idx}.")
+        frame_timestamp = float(frame_timestamp)
+
         actions: list[Float[jax.Array, "Horizon Action"]] = []
         for feature in self._action_features:
             feat = feature.name
@@ -460,7 +467,7 @@ class Dataloader:
             else:
                 if (meta := video_metadata.get(feat)) is None:
                     raise RuntimeError(f"Missing video metadata for feature {feat} in episode {episode.episode_index}.")
-                timestamp = meta.from_timestamp + feature_row["timestamp"]
+                timestamp = meta.from_timestamp + frame_timestamp
                 if not meta.from_timestamp <= timestamp < meta.to_timestamp:
                     raise RuntimeError(f"Video timestamp {timestamp} is outside episode {episode.episode_index} for feature {feat}.")
                 assert isinstance(self._video_path_template, str)
@@ -478,8 +485,10 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=self._dtype) / 255).transpose(2, 0, 1)
-                observations.append(image_tensor)
+                image_tensor = (jnp.asarray(image, dtype=jnp.promote_types(self._dtype, jnp.float32)) / 255).transpose(2, 0, 1)
+                lower, upper = self._observation_range
+                image_tensor = image_tensor * (upper - lower) + lower
+                observations.append(image_tensor.astype(self._dtype))
         return (
             jnp.stack(observations, axis=0) if observations else jnp.empty((0, 3, self._resolution[1], self._resolution[0]), self._dtype),
             jnp.concatenate(actions, axis=-1) if actions else jnp.empty((self._action_horizon, 0), self._dtype),
