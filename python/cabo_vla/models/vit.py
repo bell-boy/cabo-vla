@@ -40,7 +40,7 @@ class ViT(nnx.Module):
             strides=cfg.patch_size,
             rngs=rngs,
         )
-        self.cls_token = nnx.Param(jnp.zeros((1, 1, cfg.dim)).astype(jnp.bfloat16))  # might be able to remove with model surgery, or maybe not
+        self.cls_token = nnx.Param(jnp.zeros((1, 1, cfg.dim)))  # might be able to remove with model surgery, or maybe not
         self.pos_embed = nnx.Param(jnp.zeros((1, (cfg.input_size // cfg.patch_size) ** 2 + 1, cfg.dim)))  # with base config should be 1, 197, 768
         self.out_norm = nnx.LayerNorm(cfg.dim, epsilon=1e-12, rngs=rngs)
         # imagenet classifier head, only needed to check the hf port; pass cls_out_params=None to skip it
