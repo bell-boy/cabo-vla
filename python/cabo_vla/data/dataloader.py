@@ -1,14 +1,26 @@
+import bisect
+import contextlib
 import json
+import math
+import multiprocessing
+import queue
 import random
+import threading
+import weakref
+from collections import OrderedDict, deque
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future, ProcessPoolExecutor, wait
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
+from multiprocessing import shared_memory
 from pathlib import Path
 
 import av
 import jax
 import jax.numpy as jnp
+import numpy as np
+import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from flax import struct
@@ -49,11 +61,11 @@ class _VideoInfo:
 
 @dataclass
 class _Normalization:
-    offset: jax.Array
-    divisor: jax.Array
+    offset: np.ndarray
+    divisor: np.ndarray
     quantile: bool
 
-    def apply(self, value: jax.Array) -> jax.Array:
+    def apply(self, value: np.ndarray) -> np.ndarray:
         normalized = (value - self.offset) / self.divisor
         return 2 * normalized - 1 if self.quantile else normalized
 
@@ -106,6 +118,10 @@ class DataloaderConfig:
     shuffle: bool = True
     seed: int = 429
     episode_indices: tuple[int, ...] | None = None
+    num_workers: int = 0
+    # Batches decoded ahead of the consumer. Every batch is split into many small tasks, so a few batches keep all workers busy.
+    prefetch_batches: int = 4
+    drop_last: bool = False
 
 
 @dataclass
@@ -218,38 +234,44 @@ def _parse_dataset_feature(name: str, feature: dict, mode: NormalizationType, st
     return parsed
 
 
-def _read_row(
-    path: Path,
-    frame_index: int,
-    columns: list[str] | None = None,
-    *,
-    num_rows: int = 1,
-) -> dict[str, list]:
-    if num_rows < 0:
-        raise ValueError("num_rows must be nonnegative")
-    if num_rows == 0:
-        return {}
-    selected_columns = None if columns is None else list(dict.fromkeys(["index", *columns]))
-    table = ds.dataset(path, format="parquet").to_table(
-        columns=selected_columns,
-        filter=(ds.field("index") >= frame_index) & (ds.field("index") < frame_index + num_rows),
-    )
-    rows = table.sort_by("index").to_pydict()
-    if rows["index"] != list(range(frame_index, frame_index + num_rows)):
-        raise IndexError("Frame range not found")
-    if columns is not None and "index" not in columns:
-        rows.pop("index")
-    return rows
+def _load_data_file(path: Path, columns: list[str]) -> tuple[int, pa.Table]:
+    table = pq.read_table(path, columns=list(dict.fromkeys(["index", *columns]))).sort_by("index")
+    indices = table.column("index").to_numpy()
+    if len(indices) and not np.array_equal(indices, np.arange(indices[0], indices[0] + len(indices))):
+        raise RuntimeError(f"Expected contiguous frame indices in {path}.")
+    return (int(indices[0]) if len(indices) else 0), table
+
+
+_video_containers: OrderedDict[Path, av.container.InputContainer] = OrderedDict()
+_MAX_OPEN_VIDEOS = 64
+
+
+def _open_video(path: Path) -> av.container.InputContainer:
+    # Opening a container costs about as much as decoding the frame itself, so keep recently used files open (per process).
+    if (container := _video_containers.pop(path, None)) is None:
+        container = av.open(str(path))
+        try:
+            if not container.streams.video:
+                raise RuntimeError(f"No video stream found in {path}.")
+            stream = container.streams.video[0]
+            # Parallelism comes from the loader's worker processes; codec-level threads (dav1d defaults to one per core) oversubscribe.
+            stream.codec_context.thread_count = 1
+            if stream.time_base is None or stream.average_rate is None:
+                raise RuntimeError(f"Missing video timing information in {path}.")
+        except Exception:
+            container.close()
+            raise
+        while len(_video_containers) >= _MAX_OPEN_VIDEOS:
+            _video_containers.popitem(last=False)[1].close()
+    _video_containers[path] = container
+    return container
 
 
 def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
-    with av.open(str(path)) as container:
-        if not container.streams.video:
-            raise RuntimeError(f"No video stream found in {path}.")
-        stream = container.streams.video[0]
-        if stream.time_base is None or stream.average_rate is None:
-            raise RuntimeError(f"Missing video timing information in {path}.")
-        tolerance = 0.5 / float(stream.average_rate) + 1e-6
+    container = _open_video(path)
+    stream = container.streams.video[0]
+    tolerance = 0.5 / float(stream.average_rate) + 1e-6
+    try:
         container.seek(int(timestamp / stream.time_base), stream=stream)
         for frame in container.decode(stream):
             if frame.time is None:
@@ -258,6 +280,11 @@ def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
                 return frame.to_image()
             if frame.time > timestamp + tolerance:
                 break
+    except Exception:
+        # The decoder state is unknown after a failure; reopen the file next time.
+        _video_containers.pop(path, None)
+        container.close()
+        raise
     raise RuntimeError(f"No video frame found at {timestamp:.6f}s in {path}.")
 
 
@@ -268,21 +295,45 @@ def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stat
     values = []
     for key in keys:
         try:
-            value = jnp.asarray(stats[feature.name][key], dtype=jnp.float32)
+            value = np.asarray(stats[feature.name][key], dtype=np.float32)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Missing or invalid {key} statistics for {feature.name}.") from error
-        if value.shape != tuple(feature.shape) or not bool(jnp.all(jnp.isfinite(value))):
+        if value.shape != tuple(feature.shape) or not bool(np.all(np.isfinite(value))):
             raise ValueError(f"Expected finite {key} statistics with shape {feature.shape} for {feature.name}.")
         values.append(value)
     offset, upper_or_std = values
     quantile = mode == NormalizationType.QUANTILE
     divisor = upper_or_std - offset if quantile else upper_or_std
-    if bool(jnp.any(divisor < 0)) or not bool(jnp.all(jnp.isfinite(divisor))):
+    if bool(np.any(divisor < 0)) or not bool(np.all(np.isfinite(divisor))):
         raise ValueError(f"Invalid normalization scale for {feature.name}.")
     # Constant components have no usable scale. Subtract their offset without
     # amplifying numerical noise or dividing by zero.
-    divisor = jnp.where(divisor == 0, 1, divisor)
+    divisor = np.where(divisor == 0, 1, divisor).astype(np.float32)
     return _Normalization(offset, divisor, quantile)
+
+
+_worker_loader: "Dataloader | None" = None
+_worker_shm: shared_memory.SharedMemory | None = None
+_worker_ring: np.ndarray | None = None
+
+
+def _init_worker(loader: "Dataloader", shm_name: str, ring_shape: tuple[int, ...]) -> None:
+    global _worker_loader, _worker_shm, _worker_ring
+    _worker_loader = loader
+    _worker_shm = shared_memory.SharedMemory(name=shm_name)
+    _worker_ring = np.ndarray(ring_shape, dtype=np.uint8, buffer=_worker_shm.buf)
+
+
+def _worker_fetch_chunk(slot: int, start: int, indices: list[int]) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+    assert _worker_loader is not None and _worker_ring is not None
+    return _worker_loader._fetch_chunk(indices, _worker_ring[slot, start : start + len(indices)])
+
+
+def _release_pool(pool: ProcessPoolExecutor, shm: shared_memory.SharedMemory) -> None:
+    pool.shutdown(wait=False, cancel_futures=True)
+    shm.unlink()
+    with contextlib.suppress(BufferError):
+        shm.close()
 
 
 class Dataloader:
@@ -290,6 +341,9 @@ class Dataloader:
         self,
         config: DataloaderConfig,
         *,
+        # Applied to every batch array, so it should only partition the leading (batch) axis. None means the default device.
+        # Not part of the config: device handles don't survive pickling a saved state.
+        sharding: jax.sharding.Sharding | None = None,
         rng_state: tuple | None = None,
         order_buffer: list[int] | None = None,
         current_position: int = 0,
@@ -311,6 +365,19 @@ class Dataloader:
         self._resolution = config.resolution
         self._observation_range = config.observation_range
         self._padding_type = config.padding_type
+        self._num_workers = config.num_workers
+        self._prefetch_batches = config.prefetch_batches
+        self._drop_last = config.drop_last
+        self._sharding = sharding
+        self._np_dtype = np.dtype(config.dtype)
+        self._compute_dtype = np.promote_types(self._np_dtype, np.float32)
+        # A lookup table computed on the host: XLA rewrites x / 255 as x * (1 / 255), which misses the range endpoints by an ulp.
+        lower, upper = config.observation_range
+        self._pixel_table = (np.arange(256, dtype=self._compute_dtype) / 255 * (upper - lower) + lower).astype(self._np_dtype)
+        self._data_files: dict[Path, tuple[int, pa.Table]] = {}
+        self._pool: ProcessPoolExecutor | None = None
+        self._shm: shared_memory.SharedMemory | None = None
+        self._inflight: list[Future] = []
         if not jnp.issubdtype(config.dtype, jnp.floating):
             raise ValueError("dtype must be floating point for normalized observations")
 
@@ -408,10 +475,18 @@ class Dataloader:
 
         self._tasks: list[str] = pq.read_table(self._path / "meta" / "tasks.parquet").to_pandas().index.tolist()
 
+        self._episodes.sort(key=lambda ep: ep.data_from_index)
+        self._episode_starts = [ep.data_from_index for ep in self._episodes]
+        self._data_columns = (
+            [x.name for x in self._observation_features if x.dtype == "image"]
+            + [x.name for x in self._prio_features]
+            + [x.name for x in self._action_features]
+            + ["task_index", "timestamp"]
+        )
+        self._observation_shape = (len(self._observation_features), 3, self._resolution[1], self._resolution[0])
+
         if order_buffer is None:
-            self._order_buffer = [
-                idx for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index) for idx in range(episode.data_from_index, episode.data_to_index)
-            ]
+            self._order_buffer = [idx for episode in self._episodes for idx in range(episode.data_from_index, episode.data_to_index)]
             if self._shuffle:
                 self._rng.shuffle(self._order_buffer)
         else:
@@ -429,34 +504,144 @@ class Dataloader:
         )
 
     @classmethod
-    def from_state(cls, state: DataloaderState) -> "Dataloader":
+    def from_state(cls, state: DataloaderState, *, sharding: jax.sharding.Sharding | None = None) -> "Dataloader":
         return cls(
             state.config,
+            sharding=sharding,
             rng_state=state.rng_state,
             order_buffer=state.order_buffer,
             current_position=state.current_position,
         )
 
     def __len__(self) -> int:
-        return (len(self._order_buffer) + self._batch_size - 1) // self._batch_size
+        n = len(self._order_buffer)
+        return n // self._batch_size if self._drop_last else -(-n // self._batch_size)
 
     def __iter__(self) -> Iterator[Batch]:
-        while self.current_position < len(self._order_buffer):
-            start = self.current_position
-            indices = self._order_buffer[start : start + self._batch_size]
-            samples = [self._fetch_single(idx) for idx in indices]
-            batch = Batch(
-                observations=jnp.stack([s[0] for s in samples], axis=0),
-                instruction=[self._tokenize_instruction(s[3]) for s in samples],
-                action=jnp.stack([s[1] for s in samples], axis=0),
-                prio=jnp.stack([s[2] for s in samples], axis=0),
-                timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
-            )
-            self.current_position += len(indices)
-            yield batch
+        n = len(self._order_buffer)
+        end = n - n % self._batch_size if self._drop_last else n
+        batches = [self._order_buffer[start : start + self._batch_size] for start in range(self.current_position, end, self._batch_size)]
+        if self._num_workers == 0:
+            for indices in batches:
+                observations = np.empty((len(indices), *self._observation_shape), dtype=np.uint8)
+                batch = self._to_batch(observations, *self._fetch_chunk(indices, observations))
+                self.current_position += len(indices)
+                yield batch
+        else:
+            for batch in self._iter_parallel(batches):
+                self.current_position += len(batch.instruction)
+                yield batch
         self.current_position = 0
         if self._shuffle:
             self._rng.shuffle(self._order_buffer)
+
+    def _iter_parallel(self, batches: list[list[int]]) -> Iterator[Batch]:
+        # Workers write decoded pixels straight into a shared-memory ring (one slot per in-flight batch) and return only the small
+        # arrays through the pool. Sending images through the result pipe tops out well below 1 GB/s, far slower than the decoding.
+        slots = self._prefetch_batches + 1
+        ring_shape = (slots, self._batch_size, *self._observation_shape)
+        if self._pool is None or self._shm is None:
+            self._shm = shared_memory.SharedMemory(create=True, size=max(1, math.prod(ring_shape)))
+            # spawn, not fork: forking a process that has initialized JAX can deadlock.
+            self._pool = ProcessPoolExecutor(
+                self._num_workers, mp_context=multiprocessing.get_context("spawn"), initializer=_init_worker, initargs=(self, self._shm.name, ring_shape)
+            )
+            # Workers outlive an epoch: spawning them re-imports the training script, which takes tens of seconds.
+            weakref.finalize(self, _release_pool, self._pool, self._shm)
+        pool, shm = self._pool, self._shm
+        # Tasks left over from an interrupted iteration still write into the ring; let them finish before reusing the slots.
+        wait(self._inflight)
+        self._inflight = []
+        # Small tasks spread every batch over all workers, so batches finish in a steady stream instead of one wave per worker.
+        chunk_size = max(1, -(-self._batch_size // (4 * self._num_workers)))
+        pending: deque[tuple[int, list[Future]]] = deque()
+        # A background thread copies finished batches to the device so the transfer overlaps the train step.
+        ready: queue.Queue = queue.Queue(maxsize=2)
+        stop = threading.Event()
+
+        def put(item) -> bool:
+            while not stop.is_set():
+                try:
+                    ready.put(item, timeout=0.1)
+                    return True
+                except queue.Full:
+                    pass
+            return False
+
+        def submit(batch_index: int, indices: list[int]) -> tuple[int, list[Future]]:
+            slot = batch_index % slots
+            return slot, [pool.submit(_worker_fetch_chunk, slot, start, indices[start : start + chunk_size]) for start in range(0, len(indices), chunk_size)]
+
+        def collate(slot: int, futures: list[Future]) -> Batch:
+            results = [future.result() for future in futures]
+            instruction = [task for result in results for task in result[2]]
+            # A fresh view per batch: the segment can only be closed once no view of it is alive.
+            observations = np.ndarray(ring_shape, dtype=np.uint8, buffer=shm.buf)[slot, : len(instruction)]
+            action, prio, timestamp = (np.concatenate([result[i] for result in results], axis=0) for i in (0, 1, 3))
+            return self._to_batch(observations, action, prio, instruction, timestamp)
+
+        def produce():
+            try:
+                for batch_index, indices in enumerate(batches):
+                    pending.append(submit(batch_index, indices))
+                    if len(pending) > self._prefetch_batches and not put(collate(*pending.popleft())):
+                        return
+                while pending:
+                    if not put(collate(*pending.popleft())):
+                        return
+                put(None)
+            except BaseException as error:
+                put(error)
+
+        producer = threading.Thread(target=produce, daemon=True)
+        producer.start()
+        try:
+            while (item := ready.get()) is not None:
+                if isinstance(item, BaseException):
+                    raise item
+                yield item
+        finally:
+            stop.set()
+            producer.join()
+            self._inflight = [future for _, futures in pending for future in futures if not future.cancel()]
+
+    def _fetch_chunk(self, indices: list[int], observations: np.ndarray) -> tuple[np.ndarray, np.ndarray, list[str], np.ndarray]:
+        samples = [self._fetch_single(idx, observations[i]) for i, idx in enumerate(indices)]
+        return (
+            np.stack([s[0] for s in samples], axis=0),
+            np.stack([s[1] for s in samples], axis=0),
+            [s[2] for s in samples],
+            np.array([s[3] for s in samples], dtype=np.float32),
+        )
+
+    def _to_batch(self, observations: np.ndarray, action: np.ndarray, prio: np.ndarray, instruction: list[str], timestamp: np.ndarray) -> Batch:
+        # Wait for the host-to-device copy only (it owns the shared-memory slot); the normalize below is left in flight so the
+        # producer can run ahead instead of queueing behind the train step that is executing on the compute stream.
+        pixels, device_action, device_prio, device_timestamp = jax.block_until_ready(jax.device_put((observations, action, prio, timestamp), self._sharding))
+        # Pixels travel as uint8 and are normalized on the device: a quarter of the host traffic of float32 images.
+        return Batch(
+            observations=jnp.take(self._pixel_table, pixels),
+            instruction=[self._tokenize_instruction(text) for text in instruction],
+            action=device_action,
+            prio=device_prio,
+            timestamp=device_timestamp,
+        )
+
+    def __getstate__(self) -> dict:
+        # Workers only decode on the host: device handles in a sharding don't survive pickling, and each process fills its own table cache.
+        return {**self.__dict__, "_sharding": None, "_data_files": {}, "_pool": None, "_shm": None, "_inflight": []}
+
+    def _data_file(self, path: Path) -> tuple[int, pa.Table]:
+        if (cached := self._data_files.get(path)) is None:
+            cached = self._data_files[path] = _load_data_file(path, self._data_columns)
+        return cached
+
+    def _read_rows(self, path: Path, frame_index: int, columns: list[str], num_rows: int = 1) -> dict[str, list]:
+        first_index, table = self._data_file(path)
+        rows = table.slice(frame_index - first_index, num_rows).select(columns).to_pydict()
+        if frame_index < first_index or any(len(values) != num_rows for values in rows.values()):
+            raise IndexError("Frame range not found")
+        return rows
 
     def _tokenize_instruction(self, text: str) -> Int[jax.Array, " seq"]:
         tokens = self._tokenizer(text)[: self._config.seq_len]
@@ -466,14 +651,10 @@ class Dataloader:
             constant_values=self._config.pad_token_id,
         )
 
-    def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
-        episode: _Episode | None = None
-        for ep in self._episodes:
-            if ep.data_from_index <= idx and idx < ep.data_to_index:
-                episode = ep
-                break
-
-        if episode is None:
+    def _fetch_single(self, idx: int, observations: np.ndarray) -> tuple[np.ndarray, np.ndarray, str, float]:
+        position = bisect.bisect_right(self._episode_starts, idx) - 1
+        episode = self._episodes[position] if position >= 0 else None
+        if episode is None or not episode.data_from_index <= idx < episode.data_to_index:
             raise RuntimeError(f"Index {idx} is out of bounds.")
 
         image_features = [x.name for x in self._observation_features if x.dtype == "image"]
@@ -485,14 +666,9 @@ class Dataloader:
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
         )
-        feature_row = {name: values[0] for name, values in _read_row(self._path / feature_file, idx, columns=non_action_features).items()}
+        feature_row = {name: values[0] for name, values in self._read_rows(self._path / feature_file, idx, non_action_features).items()}
         action_count = min(self._action_horizon, episode.data_to_index - idx)
-        action_rows = _read_row(
-            self._path / feature_file,
-            idx,
-            columns=action_features,
-            num_rows=action_count,
-        )
+        action_rows = self._read_rows(self._path / feature_file, idx, action_features, num_rows=action_count)
 
         if not isinstance(task_id := feature_row.get("task_index"), int):
             raise RuntimeError(f"Expected integral task_id for frame {idx}.")
@@ -505,39 +681,38 @@ class Dataloader:
             raise RuntimeError(f"Expected scalar timestamp for frame {idx}.")
         frame_timestamp = float(frame_timestamp)
 
-        actions: list[Float[jax.Array, "Horizon Action"]] = []
+        actions: list[Float[np.ndarray, "Horizon Action"]] = []
         for feature in self._action_features:
             feat = feature.name
             if not isinstance(action := action_rows.get(feat), list):
                 raise RuntimeError(f"Failed to load action feature {feat} for frame {idx}.")
-            action_tensor = jnp.asarray(action, dtype=jnp.promote_types(self._dtype, jnp.float32))
+            action_tensor = np.asarray(action, dtype=self._compute_dtype)
             if action_tensor.ndim == 1:
                 action_tensor = action_tensor[:, None]
             if feature.normalization is not None:
                 action_tensor = feature.normalization.apply(action_tensor)
             if action_count < self._action_horizon:
-                action_tensor = jnp.pad(
+                action_tensor = np.pad(
                     action_tensor,
                     ((0, self._action_horizon - action_count), (0, 0)),
                     mode="edge" if self._padding_type == PaddingType.REPEAT_LAST else "constant",
                 )
-            actions.append(action_tensor.astype(self._dtype))
+            actions.append(action_tensor.astype(self._np_dtype))
 
-        prioperception: list[Float[jax.Array, " State"]] = []
+        prioperception: list[Float[np.ndarray, " State"]] = []
         for feature in self._prio_features:
             feat = feature.name
             if (prio := feature_row.get(feat)) is None:
                 raise RuntimeError(f"Failed to load prio feature {feat} for frame {idx}.")
             if not isinstance(prio, list):
                 prio = [prio]
-            prio_tensor = jnp.asarray(prio, dtype=jnp.promote_types(self._dtype, jnp.float32))
+            prio_tensor = np.asarray(prio, dtype=self._compute_dtype)
             if feature.normalization is not None:
                 prio_tensor = feature.normalization.apply(prio_tensor)
-            prioperception.append(prio_tensor.astype(self._dtype))
+            prioperception.append(prio_tensor.astype(self._np_dtype))
 
-        observations: list[Float[jax.Array, "Channel Height Width"]] = []
         video_metadata = {meta.feature_name: meta for meta in episode.video_metadata}
-        for feature in self._observation_features:
+        for camera, feature in enumerate(self._observation_features):
             feat = feature.name
             if feature.dtype == "image":
                 if not isinstance(image_struct := feature_row.get(feat), dict):
@@ -566,14 +741,10 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=jnp.promote_types(self._dtype, jnp.float32)) / 255).transpose(2, 0, 1)
-                lower, upper = self._observation_range
-                image_tensor = image_tensor * (upper - lower) + lower
-                observations.append(image_tensor.astype(self._dtype))
+                observations[camera] = np.asarray(image).transpose(2, 0, 1)
         return (
-            jnp.stack(observations, axis=0) if observations else jnp.empty((0, 3, self._resolution[1], self._resolution[0]), self._dtype),
-            jnp.concatenate(actions, axis=-1) if actions else jnp.empty((self._action_horizon, 0), self._dtype),
-            jnp.concatenate(prioperception, axis=-1) if prioperception else jnp.empty((0,), self._dtype),
+            np.concatenate(actions, axis=-1) if actions else np.empty((self._action_horizon, 0), self._np_dtype),
+            np.concatenate(prioperception, axis=-1) if prioperception else np.empty((0,), self._np_dtype),
             task,
             feature_row["timestamp"],
         )
