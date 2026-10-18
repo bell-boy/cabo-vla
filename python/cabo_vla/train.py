@@ -5,11 +5,14 @@ from pathlib import Path
 
 import flax.nnx as nnx
 import jax
+import numpy as np
 import optax
 from einops import rearrange, repeat
 from flax import struct
 from huggingface_hub import snapshot_download
 from jax import numpy as jnp
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
 from cabo_vla.config import VLAConfig
 from cabo_vla.data.dataloader import Batch, Dataloader, DataloaderConfig, NormalizationType
@@ -24,8 +27,11 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 class TrainConfig:
     vla: VLAConfig
     dataset_repo: str = "lerobot/libero"
-    learning_rate: float = 1e-4
-    batch_size: int = 32
+    batch_size: int = 128 * 8
+    lr_peak_value: float = 5e-3
+    lr_pct_start: float = 0.1
+    lr_div_factor: float = 1e2
+    lr_final_div_factor: float = 1e4
     num_epochs: int = 10
     seed: int = 42
     draws_per_action_chunk: int = 1  # https://abc.bot/
@@ -85,6 +91,34 @@ def ignore_instruction(_: str) -> jax.Array:
 
 
 def main():
+
+    fsdp_size = 1
+    devices = np.array(jax.devices()).reshape((-1, fsdp_size))
+    print("Device mesh shape: ", devices.shape)
+
+    mesh = Mesh(devices, ("dp", "fsdp"))
+
+    def sharding_func(x):
+        n = mesh.shape["fsdp"]
+        shape = np.shape(x)
+        if len(shape) == 0:
+            return NamedSharding(mesh, P())
+        if jnp.size(x) < 1e6:
+            return NamedSharding(mesh, P())
+        ax = -1
+        for dim in range(len(shape)):
+            if shape[dim] % n == 0:
+                ax = dim
+                break
+        if ax == -1:
+            return NamedSharding(mesh, P())
+        else:
+            p = [None] * x.ndim
+            p[ax] = "fsdp"
+            return NamedSharding(mesh, P(*p))
+
+    data_sharding = NamedSharding(mesh, P(("dp", "fsdp")))
+
     vla_config = VLAConfig(state_size=8, action_size=7)  # LIBERO: 8-dim observation.state, 7-dim action
     train_config = TrainConfig(vla=vla_config)
     init_key, train_key = jax.random.split(jax.random.key(train_config.seed), 2)
@@ -95,11 +129,6 @@ def main():
         if isinstance(m, (nnx.Linear, nnx.Conv)):
             m.dtype = jnp.bfloat16
     graphdef, state = nnx.split(vla)
-
-    optimizer = optax.adam(learning_rate=train_config.learning_rate)
-    optimizer_state = optimizer.init(state)
-
-    train_state = TrainState(model_graph=graphdef, model_state=state, optimizer=optimizer, optimizer_state=optimizer_state, key=train_key)
 
     train_loader = Dataloader(
         DataloaderConfig(
@@ -115,13 +144,31 @@ def main():
             pad_token_id=0,
             observation_range=(-1.0, 1.0),  # google/vit-base-patch16-224 expects pixels in [-1, 1]
             seed=train_config.seed,
-        )
+            num_workers=32,
+            drop_last=True,
+        ),
+        sharding=data_sharding,
     )
+
+    schedule = optax.schedules.cosine_onecycle_schedule(
+        transition_steps=len(train_loader) * train_config.num_epochs,
+        peak_value=train_config.lr_peak_value,
+        pct_start=train_config.lr_pct_start,
+        div_factor=train_config.lr_div_factor,
+        final_div_factor=train_config.lr_final_div_factor,
+    )
+
+    optimizer = optax.adam(learning_rate=schedule)
+    optimizer_state = optimizer.init(state)
+
+    train_state = TrainState(model_graph=graphdef, model_state=state, optimizer=optimizer, optimizer_state=optimizer_state, key=train_key)
+    state_shardings = jax.tree.map(sharding_func, train_state)
+    train_state = jax.device_put(train_state, state_shardings)
 
     for epoch in range(train_config.num_epochs):
         for step, batch in enumerate(train_loader):
             train_state, info = train_step(train_state, train_config, batch)
-            print(f"Epoch {epoch}, Step {step}, Loss: {info['loss']}")
+            print(f"Epoch {epoch}, Step {step}, Loss: {info['loss']}, LR: {schedule(info['step'])}")
 
 
 if __name__ == "__main__":
