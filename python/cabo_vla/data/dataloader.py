@@ -30,7 +30,7 @@ class PaddingType(Enum):
 @struct.dataclass
 class Batch:
     observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: list[Int[jax.Array, " seq"]]
+    instruction: Int[jax.Array, "Batch seq"]
     action: Float[jax.Array, "Batch Horizon Action"]
     prio: Float[jax.Array, "Batch State"]
     timestamp: Float[jax.Array, "Batch"]
@@ -96,9 +96,9 @@ class DataloaderConfig:
     observation_features: tuple[str, ...]
     action_features: tuple[tuple[str, NormalizationType], ...]
     prio_features: tuple[tuple[str, NormalizationType], ...]
-    tokenizer: Callable[[str], Int[jax.Array, " seq"]]
     seq_len: int
-    pad_token_id: int
+    tokenizer: Callable[[str], Int[jax.Array, " seq"]] | None = None
+    pad_token_id: int | None = None
     observation_range: tuple[float, float] = (0.0, 1.0)
     padding_type: PaddingType = PaddingType.REPEAT_LAST
     dtype: jax.typing.DTypeLike = jnp.float32
@@ -296,8 +296,10 @@ class Dataloader:
     ):
         if config.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if config.seq_len <= 0:
-            raise ValueError("seq_len must be positive")
+        if config.seq_len < 0:
+            raise ValueError("seq_len must be nonnegative")
+        if config.seq_len > 0 and (config.tokenizer is None or config.pad_token_id is None):
+            raise ValueError("tokenizer and pad_token_id are required when seq_len is nonzero")
         self._config = config
         self._tokenizer = config.tokenizer
         self._batch_size = config.batch_size
@@ -447,7 +449,7 @@ class Dataloader:
             samples = [self._fetch_single(idx) for idx in indices]
             batch = Batch(
                 observations=jnp.stack([s[0] for s in samples], axis=0),
-                instruction=[self._tokenize_instruction(s[3]) for s in samples],
+                instruction=jnp.stack([self._tokenize_instruction(s[3]) for s in samples], axis=0),
                 action=jnp.stack([s[1] for s in samples], axis=0),
                 prio=jnp.stack([s[2] for s in samples], axis=0),
                 timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
@@ -459,6 +461,9 @@ class Dataloader:
             self._rng.shuffle(self._order_buffer)
 
     def _tokenize_instruction(self, text: str) -> Int[jax.Array, " seq"]:
+        if self._config.seq_len == 0:
+            return jnp.empty((0,), dtype=jnp.int32)
+        assert self._tokenizer is not None
         tokens = self._tokenizer(text)[: self._config.seq_len]
         return jnp.pad(
             tokens,
