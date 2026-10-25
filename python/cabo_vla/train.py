@@ -113,9 +113,3 @@ def train(config: TrainConfig):
             logger.info(f"Loss: {train_output.loss.item()}")
     logger.info("Training complete.")
     return state
-
-
-if __name__ == "__main__":
-    from cabo_vla.training_configs.pi0 import main
-
-    main()
