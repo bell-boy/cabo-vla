@@ -82,7 +82,7 @@ dependencies = [
     { name = "einops" },
     { name = "flax" },
     { name = "huggingface-hub" },
-    { name = "jax", extra = ["cuda13"] },
+    { name = "jax" },
     { name = "jaxtyping" },
     { name = "optax" },
     { name = "pandas" },
@@ -92,6 +92,9 @@ dependencies = [
 ]
 
 [package.dev-dependencies]
+cuda = [
+    { name = "jax", extra = ["cuda13"] },
+]
 dev = [
     { name = "pre-commit" },
     { name = "pytest" },
@@ -105,7 +108,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.2" },
     { name = "flax", specifier = ">=0.12.10" },
     { name = "huggingface-hub", specifier = ">=2.2.0" },
-    { name = "jax", extras = ["cuda13"], specifier = ">=0.11.2" },
+    { name = "jax", specifier = ">=0.11.2" },
     { name = "jaxtyping", specifier = ">=0.3.11" },
     { name = "optax", specifier = ">=0.2.8" },
     { name = "pandas", specifier = ">=2.3.3" },
@@ -115,6 +118,7 @@ requires-dist = [
 ]
 
 [package.metadata.requires-dev]
+cuda = [{ name = "jax", extras = ["cuda13"], specifier = ">=0.11.2" }]
 dev = [
     { name = "pre-commit", specifier = ">=4.6.2" },
     { name = "pytest", specifier = ">=9.1.1" },
