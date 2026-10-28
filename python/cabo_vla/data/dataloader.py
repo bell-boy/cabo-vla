@@ -1,14 +1,17 @@
 import json
 import random
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from threading import Barrier, BrokenBarrierError
 
 import av
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pyarrow.dataset as ds
 import pyarrow.parquet as pq
 from flax import struct
@@ -28,12 +31,12 @@ class PaddingType(Enum):
 
 
 @struct.dataclass
-class Batch:
-    observations: Float[jax.Array, "Batch Camera Channel Height Width"]
-    instruction: Int[jax.Array, "Batch seq"]
-    action: Float[jax.Array, "Batch Horizon Action"]
-    prio: Float[jax.Array, "Batch State"]
-    timestamp: Float[jax.Array, "Batch"]
+class Batch[ArrayType]:
+    observations: Float[ArrayType, "Batch Camera Channel Height Width"]
+    instruction: Int[ArrayType, "Batch Seq"]
+    action: Float[ArrayType, "Batch Horizon Action"]
+    prio: Float[ArrayType, "Batch State"]
+    timestamp: Float[ArrayType, "Batch"]
 
 
 @dataclass
@@ -49,13 +52,16 @@ class _VideoInfo:
 
 @dataclass
 class _Normalization:
-    offset: jax.Array
-    divisor: jax.Array
+    offset: np.ndarray
+    divisor: np.ndarray
     quantile: bool
 
-    def apply(self, value: jax.Array) -> jax.Array:
-        normalized = (value - self.offset) / self.divisor
-        return 2 * normalized - 1 if self.quantile else normalized
+    def apply(self, value: np.ndarray):
+        value -= self.offset
+        value /= self.divisor
+        if self.quantile:
+            value *= 2
+            value -= 1
 
 
 @dataclass
@@ -106,6 +112,7 @@ class DataloaderConfig:
     shuffle: bool = True
     seed: int = 429
     episode_indices: tuple[int, ...] | None = None
+    num_workers: int = 1
 
 
 @dataclass
@@ -268,20 +275,20 @@ def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stat
     values = []
     for key in keys:
         try:
-            value = jnp.asarray(stats[feature.name][key], dtype=jnp.float32)
+            value = np.asarray(stats[feature.name][key], dtype=np.float32)
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"Missing or invalid {key} statistics for {feature.name}.") from error
-        if value.shape != tuple(feature.shape) or not bool(jnp.all(jnp.isfinite(value))):
+        if value.shape != tuple(feature.shape) or not bool(np.all(np.isfinite(value))):
             raise ValueError(f"Expected finite {key} statistics with shape {feature.shape} for {feature.name}.")
         values.append(value)
     offset, upper_or_std = values
     quantile = mode == NormalizationType.QUANTILE
     divisor = upper_or_std - offset if quantile else upper_or_std
-    if bool(jnp.any(divisor < 0)) or not bool(jnp.all(jnp.isfinite(divisor))):
+    if bool(np.any(divisor < 0)) or not bool(np.all(np.isfinite(divisor))):
         raise ValueError(f"Invalid normalization scale for {feature.name}.")
     # Constant components have no usable scale. Subtract their offset without
     # amplifying numerical noise or dividing by zero.
-    divisor = jnp.where(divisor == 0, 1, divisor)
+    divisor = np.where(divisor == 0, 1, divisor)
     return _Normalization(offset, divisor, quantile)
 
 
@@ -422,6 +429,33 @@ class Dataloader:
             raise ValueError("current_position must be within the order buffer")
         self.current_position = current_position
 
+        if self._config.num_workers < 1:
+            raise ValueError("num_workers must be positive")
+
+    def _worker(
+        self,
+        worker_order_buffer: list[int],
+        partial_batch_size: int,
+        partial_batch_buffer: Batch[np.ndarray],
+        write_barrier: Barrier,
+        read_barrier: Barrier,
+    ) -> None:
+        num_batches = (len(self._order_buffer) - self.current_position + self._batch_size - 1) // self._batch_size
+        try:
+            for batch_number in range(num_batches):
+                start = batch_number * partial_batch_size
+                indices = worker_order_buffer[start : start + partial_batch_size]
+                for batch_index, sample_index in enumerate(indices):
+                    self._fetch_single(sample_index, partial_batch_buffer, batch_index)
+                write_barrier.wait()
+                read_barrier.wait()
+        except BrokenBarrierError:
+            return
+        except BaseException:
+            write_barrier.abort()
+            read_barrier.abort()
+            raise
+
     def get_state(self) -> DataloaderState:
         return DataloaderState(
             config=self._config,
@@ -442,36 +476,71 @@ class Dataloader:
     def __len__(self) -> int:
         return (len(self._order_buffer) + self._batch_size - 1) // self._batch_size
 
-    def __iter__(self) -> Iterator[Batch]:
-        while self.current_position < len(self._order_buffer):
-            start = self.current_position
-            indices = self._order_buffer[start : start + self._batch_size]
-            samples = [self._fetch_single(idx) for idx in indices]
-            batch = Batch(
-                observations=jnp.stack([s[0] for s in samples], axis=0),
-                instruction=jnp.stack([self._tokenize_instruction(s[3]) for s in samples], axis=0),
-                action=jnp.stack([s[1] for s in samples], axis=0),
-                prio=jnp.stack([s[2] for s in samples], axis=0),
-                timestamp=jnp.asarray([s[4] for s in samples], dtype=jnp.float32),
-            )
-            self.current_position += len(indices)
-            yield batch
+    def __iter__(self) -> Iterator[Batch[jax.Array]]:
+        action_dim = sum(feature.shape[0] if feature.shape else 1 for feature in self._action_features)
+        prio_dim = sum(feature.shape[0] if feature.shape else 1 for feature in self._prio_features)
+        work_dtype = np.dtype(jnp.promote_types(self._dtype, jnp.float32))
+        shapes = {
+            "observations": ((self._batch_size, len(self._observation_features), 3, self._resolution[1], self._resolution[0]), work_dtype),
+            "instruction": ((self._batch_size, self._config.seq_len), np.dtype(np.int32)),
+            "action": ((self._batch_size, self._action_horizon, action_dim), work_dtype),
+            "prio": ((self._batch_size, prio_dim), work_dtype),
+            "timestamp": ((self._batch_size,), np.dtype(np.float32)),
+        }
+        batch_buffer = Batch(**{field: np.empty(shape, dtype=dtype) for field, (shape, dtype) in shapes.items()})
+        write_barrier = Barrier(self._config.num_workers + 1)
+        read_barrier = Barrier(self._config.num_workers + 1)
+        epoch_start = self.current_position
+        num_batches = (len(self._order_buffer) - epoch_start + self._batch_size - 1) // self._batch_size
+        with ThreadPoolExecutor(max_workers=self._config.num_workers) as pool:
+            workers = []
+            try:
+                base_size, remainder = divmod(self._batch_size, self._config.num_workers)
+                offset = 0
+                for worker_index in range(self._config.num_workers):
+                    partial_batch_size = base_size + (worker_index < remainder)
+                    worker_order_buffer = [
+                        idx
+                        for start in range(epoch_start, len(self._order_buffer), self._batch_size)
+                        for idx in self._order_buffer[start + offset : min(start + offset + partial_batch_size, start + self._batch_size)]
+                    ]
+                    partial_batch_buffer = jax.tree.map(lambda array: array[offset : offset + partial_batch_size], batch_buffer)
+                    workers.append(pool.submit(self._worker, worker_order_buffer, partial_batch_size, partial_batch_buffer, write_barrier, read_barrier))
+                    offset += partial_batch_size
+                for _ in range(num_batches):
+                    write_barrier.wait()
+                    batch_size = min(self._batch_size, len(self._order_buffer) - self.current_position)
+                    batch = Batch(
+                        observations=jnp.array(batch_buffer.observations[:batch_size], dtype=self._dtype, copy=True),
+                        instruction=jnp.array(batch_buffer.instruction[:batch_size], copy=True),
+                        action=jnp.array(batch_buffer.action[:batch_size], dtype=self._dtype, copy=True),
+                        prio=jnp.array(batch_buffer.prio[:batch_size], dtype=self._dtype, copy=True),
+                        timestamp=jnp.array(batch_buffer.timestamp[:batch_size], copy=True),
+                    )
+                    jax.block_until_ready(batch)
+                    read_barrier.wait()
+                    self.current_position += batch_size
+                    yield batch
+            except BrokenBarrierError as error:
+                for worker in workers:
+                    worker.result()
+                raise RuntimeError("A dataloader worker stopped before completing a batch.") from error
+            finally:
+                write_barrier.abort()
+                read_barrier.abort()
         self.current_position = 0
         if self._shuffle:
             self._rng.shuffle(self._order_buffer)
 
-    def _tokenize_instruction(self, text: str) -> Int[jax.Array, " seq"]:
+    def _tokenize_instruction(self, text: str, buffer: Int[np.ndarray, " seq"]) -> None:
         if self._config.seq_len == 0:
-            return jnp.empty((0,), dtype=jnp.int32)
+            return
         assert self._tokenizer is not None
-        tokens = self._tokenizer(text)[: self._config.seq_len]
-        return jnp.pad(
-            tokens,
-            (0, self._config.seq_len - tokens.shape[0]),
-            constant_values=self._config.pad_token_id,
-        )
+        tokens = np.asarray(self._tokenizer(text), dtype=np.int32)[: self._config.seq_len]
+        buffer[: tokens.shape[0]] = tokens
+        buffer[tokens.shape[0] :] = self._config.pad_token_id
 
-    def _fetch_single(self, idx: int) -> tuple[jax.Array, jax.Array, jax.Array, str, float]:
+    def _fetch_single(self, idx: int, batch_buffer: Batch[np.ndarray], batch_index: int) -> None:
         episode: _Episode | None = None
         for ep in self._episodes:
             if ep.data_from_index <= idx and idx < ep.data_to_index:
@@ -510,39 +579,45 @@ class Dataloader:
             raise RuntimeError(f"Expected scalar timestamp for frame {idx}.")
         frame_timestamp = float(frame_timestamp)
 
-        actions: list[Float[jax.Array, "Horizon Action"]] = []
+        self._tokenize_instruction(task, batch_buffer.instruction[batch_index])
+        batch_buffer.timestamp[batch_index] = frame_timestamp
+
+        actions = batch_buffer.action[batch_index]
+        start_dim = 0
         for feature in self._action_features:
             feat = feature.name
             if not isinstance(action := action_rows.get(feat), list):
                 raise RuntimeError(f"Failed to load action feature {feat} for frame {idx}.")
-            action_tensor = jnp.asarray(action, dtype=jnp.promote_types(self._dtype, jnp.float32))
-            if action_tensor.ndim == 1:
-                action_tensor = action_tensor[:, None]
+            feature_length = feature.shape[0] if feature.shape else 1
+            values = np.asarray(action)
+            if values.ndim == 1:
+                values = values[:, None]
+            view = actions[:action_count, start_dim : start_dim + feature_length]
+            view[:] = values
             if feature.normalization is not None:
-                action_tensor = feature.normalization.apply(action_tensor)
-            if action_count < self._action_horizon:
-                action_tensor = jnp.pad(
-                    action_tensor,
-                    ((0, self._action_horizon - action_count), (0, 0)),
-                    mode="edge" if self._padding_type == PaddingType.REPEAT_LAST else "constant",
-                )
-            actions.append(action_tensor.astype(self._dtype))
+                feature.normalization.apply(view)
+            start_dim += feature_length
+        if action_count < self._action_horizon:
+            match self._padding_type:
+                case PaddingType.REPEAT_LAST:
+                    actions[action_count:] = actions[action_count - 1]
+                case PaddingType.ZERO:
+                    actions[action_count:] = 0
 
-        prioperception: list[Float[jax.Array, " State"]] = []
+        start_dim = 0
         for feature in self._prio_features:
             feat = feature.name
             if (prio := feature_row.get(feat)) is None:
                 raise RuntimeError(f"Failed to load prio feature {feat} for frame {idx}.")
-            if not isinstance(prio, list):
-                prio = [prio]
-            prio_tensor = jnp.asarray(prio, dtype=jnp.promote_types(self._dtype, jnp.float32))
+            feature_length = feature.shape[0] if feature.shape else 1
+            view = batch_buffer.prio[batch_index, start_dim : start_dim + feature_length]
+            view[:] = prio
             if feature.normalization is not None:
-                prio_tensor = feature.normalization.apply(prio_tensor)
-            prioperception.append(prio_tensor.astype(self._dtype))
+                feature.normalization.apply(view)
+            start_dim += feature_length
 
-        observations: list[Float[jax.Array, "Channel Height Width"]] = []
         video_metadata = {meta.feature_name: meta for meta in episode.video_metadata}
-        for feature in self._observation_features:
+        for camera_index, feature in enumerate(self._observation_features):
             feat = feature.name
             if feature.dtype == "image":
                 if not isinstance(image_struct := feature_row.get(feat), dict):
@@ -571,14 +646,9 @@ class Dataloader:
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
-                image_tensor = (jnp.asarray(image, dtype=jnp.promote_types(self._dtype, jnp.float32)) / 255).transpose(2, 0, 1)
+                view = batch_buffer.observations[batch_index, camera_index]
+                view[:] = np.asarray(image).transpose(2, 0, 1)
+                view /= 255
                 lower, upper = self._observation_range
-                image_tensor = image_tensor * (upper - lower) + lower
-                observations.append(image_tensor.astype(self._dtype))
-        return (
-            jnp.stack(observations, axis=0) if observations else jnp.empty((0, 3, self._resolution[1], self._resolution[0]), self._dtype),
-            jnp.concatenate(actions, axis=-1) if actions else jnp.empty((self._action_horizon, 0), self._dtype),
-            jnp.concatenate(prioperception, axis=-1) if prioperception else jnp.empty((0,), self._dtype),
-            task,
-            feature_row["timestamp"],
-        )
+                view *= upper - lower
+                view += lower
