@@ -3,6 +3,7 @@
 import argparse
 import random
 import time
+from dataclasses import replace
 from pathlib import Path
 
 from huggingface_hub import snapshot_download
@@ -36,19 +37,21 @@ def main():
         seq_len=0,
         episode_indices=tuple(rng.sample(range(TOTAL_LIBERO_EPISODES), 100)),
     )
-    dataloader = Dataloader(dataloader_config)
-    times = []
-    for _ in trange(args.n_epochs, desc="Epochs"):
-        start_time = time.perf_counter()
-        for batch in tqdm(dataloader, desc="Batches", leave=False):
-            pass
-        end_time = time.perf_counter()
-        times.append(end_time - start_time)
+    for num_workers in (1, 2, 4, 8):
+        print(f"\nThreads: {num_workers}", flush=True)
+        dataloader = Dataloader(replace(dataloader_config, num_workers=num_workers))
+        times = []
+        for _ in trange(args.n_epochs, desc=f"Epochs ({num_workers} threads)"):
+            start_time = time.perf_counter()
+            for batch in tqdm(dataloader, desc="Batches", leave=False):
+                pass
+            end_time = time.perf_counter()
+            times.append(end_time - start_time)
 
-    for i, t in enumerate(times):
-        print(f"Epoch {i}: {t:.2f} seconds")
-    print(f"Total time for {args.n_epochs} epochs: {sum(times):.2f} seconds")
-    print(f"Samples per second: {len(dataloader._order_buffer) * args.n_epochs / sum(times):.2f}")
+        for i, t in enumerate(times):
+            print(f"Epoch {i}: {t:.2f} seconds")
+        print(f"Total time for {args.n_epochs} epochs: {sum(times):.2f} seconds")
+        print(f"Samples per second: {len(dataloader._order_buffer) * args.n_epochs / sum(times):.2f}", flush=True)
 
 
 if __name__ == "__main__":
