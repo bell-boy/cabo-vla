@@ -4,6 +4,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from enum import Enum
+from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 from threading import Barrier, BrokenBarrierError
@@ -113,6 +114,7 @@ class DataloaderConfig:
     seed: int = 429
     episode_indices: tuple[int, ...] | None = None
     num_workers: int = 1
+    container_pool_size: int = 32
 
 
 @dataclass
@@ -249,23 +251,29 @@ def _read_row(
     return rows
 
 
-def _read_video_frame(path: Path, timestamp: float) -> Image.Image:
-    with av.open(str(path)) as container:
-        if not container.streams.video:
-            raise RuntimeError(f"No video stream found in {path}.")
-        stream = container.streams.video[0]
-        if stream.time_base is None or stream.average_rate is None:
-            raise RuntimeError(f"Missing video timing information in {path}.")
-        tolerance = 0.5 / float(stream.average_rate) + 1e-6
-        container.seek(int(timestamp / stream.time_base), stream=stream)
-        for frame in container.decode(stream):
-            if frame.time is None:
-                continue
-            if abs(frame.time - timestamp) <= tolerance:
-                return frame.to_image()
-            if frame.time > timestamp + tolerance:
-                break
-    raise RuntimeError(f"No video frame found at {timestamp:.6f}s in {path}.")
+def _open_video(path: Path, worker_id: int) -> av.container.InputContainer:
+    container = av.open(str(path), mode="r")
+    for stream in container.streams.video:
+        stream.thread_count = 1
+    return container
+
+
+def _read_video_frame(container: av.container.InputContainer, timestamp: float) -> Image.Image:
+    if not container.streams.video:
+        raise RuntimeError(f"No video stream found in {container.name}.")
+    stream = container.streams.video[0]
+    if stream.time_base is None or stream.average_rate is None:
+        raise RuntimeError(f"Missing video timing information in {container.name}.")
+    tolerance = 0.5 / float(stream.average_rate) + 1e-6
+    container.seek(int(timestamp / stream.time_base), stream=stream)
+    for frame in container.decode(stream):
+        if frame.time is None:
+            continue
+        if abs(frame.time - timestamp) <= tolerance:
+            return frame.to_image()
+        if frame.time > timestamp + tolerance:
+            break
+    raise RuntimeError(f"No video frame found at {timestamp:.6f}s in {container.name}.")
 
 
 def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stats: dict) -> _Normalization | None:
@@ -303,6 +311,9 @@ class Dataloader:
     ):
         if config.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if config.container_pool_size <= 0:
+            raise ValueError("container_pool_size must be positive")
+        self._open_video = lru_cache(maxsize=config.container_pool_size)(_open_video)
         if config.seq_len < 0:
             raise ValueError("seq_len must be nonnegative")
         if config.seq_len > 0 and (config.tokenizer is None or config.pad_token_id is None):
@@ -434,6 +445,7 @@ class Dataloader:
 
     def _worker(
         self,
+        worker_id: int,
         worker_order_buffer: list[int],
         partial_batch_size: int,
         partial_batch_buffer: Batch[np.ndarray],
@@ -446,7 +458,7 @@ class Dataloader:
                 start = batch_number * partial_batch_size
                 indices = worker_order_buffer[start : start + partial_batch_size]
                 for batch_index, sample_index in enumerate(indices):
-                    self._fetch_single(sample_index, partial_batch_buffer, batch_index)
+                    self._fetch_single(sample_index, partial_batch_buffer, batch_index, worker_id)
                 write_barrier.wait()
                 read_barrier.wait()
         except BrokenBarrierError:
@@ -487,7 +499,14 @@ class Dataloader:
             "prio": ((self._batch_size, prio_dim), work_dtype),
             "timestamp": ((self._batch_size,), np.dtype(np.float32)),
         }
-        batch_buffer = Batch(**{field: np.empty(shape, dtype=dtype) for field, (shape, dtype) in shapes.items()})
+
+        def aligned_empty(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
+            nbytes = int(np.prod(shape)) * dtype.itemsize
+            storage = np.empty(nbytes + 63, dtype=np.uint8)
+            offset = (-storage.ctypes.data) % 64
+            return storage[offset : offset + nbytes].view(dtype).reshape(shape)
+
+        batch_buffer = Batch(**{field: aligned_empty(shape, dtype) for field, (shape, dtype) in shapes.items()})
         write_barrier = Barrier(self._config.num_workers + 1)
         read_barrier = Barrier(self._config.num_workers + 1)
         epoch_start = self.current_position
@@ -505,7 +524,9 @@ class Dataloader:
                         for idx in self._order_buffer[start + offset : min(start + offset + partial_batch_size, start + self._batch_size)]
                     ]
                     partial_batch_buffer = jax.tree.map(lambda array: array[offset : offset + partial_batch_size], batch_buffer)
-                    workers.append(pool.submit(self._worker, worker_order_buffer, partial_batch_size, partial_batch_buffer, write_barrier, read_barrier))
+                    workers.append(
+                        pool.submit(self._worker, worker_index, worker_order_buffer, partial_batch_size, partial_batch_buffer, write_barrier, read_barrier)
+                    )
                     offset += partial_batch_size
                 for _ in range(num_batches):
                     write_barrier.wait()
@@ -540,7 +561,7 @@ class Dataloader:
         buffer[: tokens.shape[0]] = tokens
         buffer[tokens.shape[0] :] = self._config.pad_token_id
 
-    def _fetch_single(self, idx: int, batch_buffer: Batch[np.ndarray], batch_index: int) -> None:
+    def _fetch_single(self, idx: int, batch_buffer: Batch[np.ndarray], batch_index: int, worker_id: int) -> None:
         episode: _Episode | None = None
         for ep in self._episodes:
             if ep.data_from_index <= idx and idx < ep.data_to_index:
@@ -637,7 +658,8 @@ class Dataloader:
                     chunk_index=meta.chunk_idx,
                     file_index=meta.file_idx,
                 )
-                source_image = _read_video_frame(self._path / video_file, timestamp)
+                container = self._open_video(self._path / video_file, worker_id)
+                source_image = _read_video_frame(container, timestamp)
 
             with source_image as image:
                 image = ImageOps.pad(
