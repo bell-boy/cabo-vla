@@ -50,6 +50,7 @@ class VLA(nnx.Module):
         self.pos_embed = nnx.Param(jnp.zeros((1, cfg.action_chunk_size, cfg.action_dim)))
         self.time_embed_up = nnx.Linear(cfg.action_dim * 2, cfg.action_dim, rngs=rngs)
         self.time_embed_down = nnx.Linear(cfg.action_dim, cfg.action_dim, rngs=rngs)
+        self.out_norm = nnx.LayerNorm(cfg.action_dim, epsilon=1e-12, rngs=rngs)
 
     def sin_cos_pos_embed(self, timestamp: Float[jax.Array, " Batch"], max_period: float = 4, min_period: float = 0.004) -> Float[jax.Array, "Batch D"]:
         frac = jnp.linspace(0, 1, self.cfg.action_dim // 2)
@@ -82,4 +83,4 @@ class VLA(nnx.Module):
         x = self.time_embed_down(jax.nn.silu(self.time_embed_up(x)))
         for block, kv_cache in zip(self.action_blocks, cache):
             x, _ = block(x, kv_cache)
-        return self.action_out(x)
+        return self.action_out(self.out_norm(x))
