@@ -1,13 +1,17 @@
 import json
+import multiprocessing as mp
 import random
+import traceback
+from collections import OrderedDict
 from collections.abc import Callable, Iterator
-from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from contextlib import suppress
+from copy import copy
+from dataclasses import dataclass, replace
 from enum import Enum
-from functools import lru_cache
 from io import BytesIO
+from multiprocessing.connection import Connection
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
-from threading import Barrier, BrokenBarrierError
 
 import av
 import jax
@@ -251,7 +255,7 @@ def _read_row(
     return rows
 
 
-def _open_video(path: Path, worker_id: int) -> av.container.InputContainer:
+def _open_video(path: Path) -> av.container.InputContainer:
     container = av.open(str(path), mode="r")
     for stream in container.streams.video:
         stream.thread_count = 1
@@ -300,7 +304,59 @@ def _parse_normalization(feature: _DatasetFeature, mode: NormalizationType, stat
     return _Normalization(offset, divisor, quantile)
 
 
+class _DecoderCache:
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        self.containers: OrderedDict[Path, av.container.InputContainer] = OrderedDict()
+
+    def open(self, path: Path) -> av.container.InputContainer:
+        if path in self.containers:
+            self.containers.move_to_end(path)
+            return self.containers[path]
+        if len(self.containers) >= self.capacity:
+            _, container = self.containers.popitem(last=False)
+            container.close()
+        container = _open_video(path)
+        self.containers[path] = container
+        return container
+
+    def close(self) -> None:
+        for container in self.containers.values():
+            container.close()
+        self.containers.clear()
+
+
+def _batch_buffers(memory: SharedMemory, layout: np.dtype) -> list[Batch[np.ndarray]]:
+    slots = np.ndarray((2,), dtype=layout, buffer=memory.buf)
+    names = layout.names
+    assert names is not None
+    return [Batch(**{name: slots[name][slot] for name in names}) for slot in range(len(slots))]
+
+
+def _process_worker(loader: "Dataloader", name: str, layout: np.dtype, connection: Connection) -> None:
+    loader._decoder_cache = _DecoderCache(loader._config.container_pool_size)
+    try:
+        memory = SharedMemory(name=name)
+        try:
+            buffers = _batch_buffers(memory, layout)
+            while (job := connection.recv()) is not None:
+                slot, indices = job
+                for batch_index, sample_index in indices:
+                    loader._fetch_single(sample_index, buffers[slot], batch_index)
+                connection.send(None)
+        finally:
+            memory.close()
+    except Exception:
+        with suppress(BrokenPipeError, EOFError):
+            connection.send(traceback.format_exc())
+    finally:
+        connection.close()
+        loader._decoder_cache.close()
+
+
 class Dataloader:
+    _decoder_cache: _DecoderCache
+
     def __init__(
         self,
         config: DataloaderConfig,
@@ -313,28 +369,18 @@ class Dataloader:
             raise ValueError("batch_size must be positive")
         if config.container_pool_size <= 0:
             raise ValueError("container_pool_size must be positive")
-        self._open_video = lru_cache(maxsize=config.container_pool_size)(_open_video)
         if config.seq_len < 0:
             raise ValueError("seq_len must be nonnegative")
         if config.seq_len > 0 and (config.tokenizer is None or config.pad_token_id is None):
             raise ValueError("tokenizer and pad_token_id are required when seq_len is nonzero")
         self._config = config
-        self._tokenizer = config.tokenizer
-        self._batch_size = config.batch_size
-        self._action_horizon = config.action_horizon
-        self._path = config.path
         self._rng = random.Random(config.seed)
         if rng_state is not None:
             self._rng.setstate(rng_state)
-        self._shuffle = config.shuffle
-        self._dtype = config.dtype
-        self._resolution = config.resolution
-        self._observation_range = config.observation_range
-        self._padding_type = config.padding_type
         if not jnp.issubdtype(config.dtype, jnp.floating):
             raise ValueError("dtype must be floating point for normalized observations")
 
-        info_file = self._path / "meta" / "info.json"
+        info_file = config.path / "meta" / "info.json"
         with open(info_file) as f:
             info = json.load(f)
 
@@ -358,28 +404,24 @@ class Dataloader:
 
         stats = {}
         if any(mode != NormalizationType.NONE for _, mode in config.action_features + config.prio_features):
-            with open(self._path / "meta" / "stats.json") as f:
+            with open(config.path / "meta" / "stats.json") as f:
                 stats = json.load(f)
             if not isinstance(stats, dict):
                 raise ValueError("Expected meta/stats.json to contain a JSON dict.")
 
-        self._action_features: list[_DatasetFeature] = []
-        for feature_name, mode in config.action_features:
-            if not isinstance(feature_dict := features.get(feature_name), dict):
-                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
-            if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(f"Action feature {feature_name} has unsupported dtype {feature.dtype}")
-            self._action_features.append(feature)
+        def numeric_features(specs: tuple[tuple[str, NormalizationType], ...], label: str) -> list[_DatasetFeature]:
+            result = []
+            for name, mode in specs:
+                if not isinstance(feature_dict := features.get(name), dict):
+                    raise RuntimeError(f"Failed to find feature {name} in dataset")
+                feature = _parse_dataset_feature(name, feature_dict, mode, stats)
+                if feature.dtype in {"image", "video", "string", "large_string"}:
+                    raise RuntimeError(f"{label} feature {name} has unsupported dtype {feature.dtype}")
+                result.append(feature)
+            return result
 
-        self._prio_features: list[_DatasetFeature] = []
-        for feature_name, mode in config.prio_features:
-            if not isinstance(feature_dict := features.get(feature_name), dict):
-                raise RuntimeError(f"Failed to find feature {feature_name} in dataset")
-            feature = _parse_dataset_feature(feature_name, feature_dict, mode, stats)
-            if feature.dtype in {"image", "video", "string", "large_string"}:
-                raise RuntimeError(f"Prio feature {feature_name} has unsupported dtype {feature.dtype}")
-            self._prio_features.append(feature)
+        self._action_features = numeric_features(config.action_features, "Action")
+        self._prio_features = numeric_features(config.prio_features, "Prio")
 
         if config.action_horizon <= 0:
             raise ValueError("action_horizon must be positive")
@@ -405,7 +447,7 @@ class Dataloader:
         self._episodes = [
             episode
             for episode in _iter_episodes(
-                self._path,
+                config.path,
                 [feature.name for feature in self._observation_features if feature.dtype == "video"],
             )
             if episode.episode_index in split_episodes
@@ -426,13 +468,13 @@ class Dataloader:
             if not isinstance(self._video_path_template, str):
                 raise RuntimeError("Expected string video_path for video observations.")
 
-        self._tasks: list[str] = pq.read_table(self._path / "meta" / "tasks.parquet").to_pandas().index.tolist()
+        tasks: list[str] = pq.read_table(config.path / "meta" / "tasks.parquet").to_pandas().index.tolist()
 
         if order_buffer is None:
             self._order_buffer = [
                 idx for episode in sorted(self._episodes, key=lambda ep: ep.data_from_index) for idx in range(episode.data_from_index, episode.data_to_index)
             ]
-            if self._shuffle:
+            if config.shuffle:
                 self._rng.shuffle(self._order_buffer)
         else:
             self._order_buffer = order_buffer.copy()
@@ -440,33 +482,16 @@ class Dataloader:
             raise ValueError("current_position must be within the order buffer")
         self.current_position = current_position
 
-        if self._config.num_workers < 1:
+        if config.num_workers < 1:
             raise ValueError("num_workers must be positive")
 
-    def _worker(
-        self,
-        worker_id: int,
-        worker_order_buffer: list[int],
-        partial_batch_size: int,
-        partial_batch_buffer: Batch[np.ndarray],
-        write_barrier: Barrier,
-        read_barrier: Barrier,
-    ) -> None:
-        num_batches = (len(self._order_buffer) - self.current_position + self._batch_size - 1) // self._batch_size
-        try:
-            for batch_number in range(num_batches):
-                start = batch_number * partial_batch_size
-                indices = worker_order_buffer[start : start + partial_batch_size]
-                for batch_index, sample_index in enumerate(indices):
-                    self._fetch_single(sample_index, partial_batch_buffer, batch_index, worker_id)
-                write_barrier.wait()
-                read_barrier.wait()
-        except BrokenBarrierError:
-            return
-        except BaseException:
-            write_barrier.abort()
-            read_barrier.abort()
-            raise
+        pad_token_id = config.pad_token_id if config.pad_token_id is not None else 0
+        self._task_tokens = np.full((len(tasks), config.seq_len), pad_token_id, dtype=np.int32)
+        if config.seq_len:
+            assert config.tokenizer is not None
+            for task, buffer in zip(tasks, self._task_tokens, strict=True):
+                tokens = np.asarray(config.tokenizer(task), dtype=np.int32)[: config.seq_len]
+                buffer[: len(tokens)] = tokens
 
     def get_state(self) -> DataloaderState:
         return DataloaderState(
@@ -486,88 +511,111 @@ class Dataloader:
         )
 
     def __len__(self) -> int:
-        return (len(self._order_buffer) + self._batch_size - 1) // self._batch_size
+        return (len(self._order_buffer) + self._config.batch_size - 1) // self._config.batch_size
 
     def __iter__(self) -> Iterator[Batch[jax.Array]]:
-        action_dim = sum(feature.shape[0] if feature.shape else 1 for feature in self._action_features)
-        prio_dim = sum(feature.shape[0] if feature.shape else 1 for feature in self._prio_features)
-        work_dtype = np.dtype(jnp.promote_types(self._dtype, jnp.float32))
-        shapes = {
-            "observations": ((self._batch_size, len(self._observation_features), 3, self._resolution[1], self._resolution[0]), work_dtype),
-            "instruction": ((self._batch_size, self._config.seq_len), np.dtype(np.int32)),
-            "action": ((self._batch_size, self._action_horizon, action_dim), work_dtype),
-            "prio": ((self._batch_size, prio_dim), work_dtype),
-            "timestamp": ((self._batch_size,), np.dtype(np.float32)),
-        }
-
-        def aligned_empty(shape: tuple[int, ...], dtype: np.dtype) -> np.ndarray:
-            nbytes = int(np.prod(shape)) * dtype.itemsize
-            storage = np.empty(nbytes + 63, dtype=np.uint8)
-            offset = (-storage.ctypes.data) % 64
-            return storage[offset : offset + nbytes].view(dtype).reshape(shape)
-
-        batch_buffer = Batch(**{field: aligned_empty(shape, dtype) for field, (shape, dtype) in shapes.items()})
-        write_barrier = Barrier(self._config.num_workers + 1)
-        read_barrier = Barrier(self._config.num_workers + 1)
-        epoch_start = self.current_position
-        num_batches = (len(self._order_buffer) - epoch_start + self._batch_size - 1) // self._batch_size
-        with ThreadPoolExecutor(max_workers=self._config.num_workers) as pool:
-            workers = []
-            try:
-                base_size, remainder = divmod(self._batch_size, self._config.num_workers)
-                offset = 0
-                for worker_index in range(self._config.num_workers):
-                    partial_batch_size = base_size + (worker_index < remainder)
-                    worker_order_buffer = [
-                        idx
-                        for start in range(epoch_start, len(self._order_buffer), self._batch_size)
-                        for idx in self._order_buffer[start + offset : min(start + offset + partial_batch_size, start + self._batch_size)]
-                    ]
-                    partial_batch_buffer = jax.tree.map(lambda array: array[offset : offset + partial_batch_size], batch_buffer)
-                    workers.append(
-                        pool.submit(self._worker, worker_index, worker_order_buffer, partial_batch_size, partial_batch_buffer, write_barrier, read_barrier)
-                    )
-                    offset += partial_batch_size
-                for _ in range(num_batches):
-                    write_barrier.wait()
-                    batch_size = min(self._batch_size, len(self._order_buffer) - self.current_position)
-                    batch = Batch(
-                        observations=jnp.array(batch_buffer.observations[:batch_size], dtype=self._dtype, copy=True),
-                        instruction=jnp.array(batch_buffer.instruction[:batch_size], copy=True),
-                        action=jnp.array(batch_buffer.action[:batch_size], dtype=self._dtype, copy=True),
-                        prio=jnp.array(batch_buffer.prio[:batch_size], dtype=self._dtype, copy=True),
-                        timestamp=jnp.array(batch_buffer.timestamp[:batch_size], copy=True),
-                    )
-                    jax.block_until_ready(batch)
-                    read_barrier.wait()
-                    self.current_position += batch_size
-                    yield batch
-            except BrokenBarrierError as error:
-                for worker in workers:
-                    worker.result()
-                raise RuntimeError("A dataloader worker stopped before completing a batch.") from error
-            finally:
-                write_barrier.abort()
-                read_barrier.abort()
+        if self.current_position < len(self._order_buffer):
+            yield from self._iter_batches()
         self.current_position = 0
-        if self._shuffle:
+        if self._config.shuffle:
             self._rng.shuffle(self._order_buffer)
 
-    def _tokenize_instruction(self, text: str, buffer: Int[np.ndarray, " seq"]) -> None:
-        if self._config.seq_len == 0:
-            return
-        assert self._tokenizer is not None
-        tokens = np.asarray(self._tokenizer(text), dtype=np.int32)[: self._config.seq_len]
-        buffer[: tokens.shape[0]] = tokens
-        buffer[tokens.shape[0] :] = self._config.pad_token_id
+    def _iter_batches(self) -> Iterator[Batch[jax.Array]]:
+        config = self._config
+        action_prefix = (self._action_features[0].shape or (1,))[:-1] if self._action_features else ()
+        action_dim = sum((feature.shape or (1,))[-1] for feature in self._action_features)
+        prio_prefix = (self._prio_features[0].shape or (1,))[:-1] if self._prio_features else ()
+        prio_dim = sum((feature.shape or (1,))[-1] for feature in self._prio_features)
+        work_dtype = np.dtype(jnp.promote_types(config.dtype, jnp.float32))
+        width, height = config.resolution
+        layout = np.dtype(
+            [
+                ("observations", work_dtype, (config.batch_size, len(self._observation_features), 3, height, width)),
+                ("instruction", np.int32, (config.batch_size, config.seq_len)),
+                ("action", work_dtype, (config.batch_size, config.action_horizon, *action_prefix, action_dim)),
+                ("prio", work_dtype, (config.batch_size, *prio_prefix, prio_dim)),
+                ("timestamp", np.float32, (config.batch_size,)),
+            ],
+            align=True,
+        )
 
-    def _fetch_single(self, idx: int, batch_buffer: Batch[np.ndarray], batch_index: int, worker_id: int) -> None:
-        episode: _Episode | None = None
-        for ep in self._episodes:
-            if ep.data_from_index <= idx and idx < ep.data_to_index:
-                episode = ep
-                break
+        # Workers receive the precomputed tokens without the tokenizer.
+        worker_loader = copy(self)
+        worker_loader._config = replace(config, tokenizer=None)
+        worker_loader._order_buffer = []
 
+        context = mp.get_context("spawn")
+        worker_count = min(config.num_workers, config.batch_size)
+        workers = []
+        completed = False
+        memory = SharedMemory(create=True, size=2 * layout.itemsize)
+        try:
+            buffers = _batch_buffers(memory, layout)
+            for _ in range(worker_count):
+                parent, child = context.Pipe()
+                process = context.Process(target=_process_worker, args=(worker_loader, memory.name, layout, child), daemon=True)
+                with child:
+                    try:
+                        process.start()
+                    except BaseException:
+                        parent.close()
+                        raise
+                workers.append((process, parent))
+
+            starts = range(self.current_position, len(self._order_buffer), config.batch_size)
+
+            def dispatch(batch_number: int) -> None:
+                start = starts[batch_number]
+                indices = list(enumerate(self._order_buffer[start : start + config.batch_size]))
+                for worker_index, (_, connection) in enumerate(workers):
+                    connection.send((batch_number % 2, indices[worker_index::worker_count]))
+
+            for batch_number in range(min(2, len(starts))):
+                dispatch(batch_number)
+            for batch_number, start in enumerate(starts):
+                for process, connection in workers:
+                    try:
+                        error = connection.recv()
+                    except (EOFError, ConnectionError) as exc:
+                        raise RuntimeError(f"Dataloader worker {process.pid} exited before completing a batch.") from exc
+                    if error is not None:
+                        raise RuntimeError(f"Dataloader worker failed:\n{error}")
+
+                size = min(config.batch_size, len(self._order_buffer) - start)
+                buffer = buffers[batch_number % 2]
+                batch = Batch(
+                    observations=jnp.array(buffer.observations[:size], dtype=config.dtype, copy=True),
+                    instruction=jnp.array(buffer.instruction[:size], copy=True),
+                    action=jnp.array(buffer.action[:size], dtype=config.dtype, copy=True),
+                    prio=jnp.array(buffer.prio[:size], dtype=config.dtype, copy=True),
+                    timestamp=jnp.array(buffer.timestamp[:size], copy=True),
+                )
+                # Wait for device copies before letting workers overwrite this slot.
+                jax.block_until_ready(batch)
+                if batch_number + 2 < len(starts):
+                    dispatch(batch_number + 2)
+                self.current_position = start + size
+                yield batch
+            completed = True
+        finally:
+            for process, connection in workers:
+                if completed:
+                    with suppress(BrokenPipeError, EOFError):
+                        connection.send(None)
+                elif process.is_alive():
+                    process.terminate()
+                connection.close()
+            for process, _ in workers:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.kill()
+                    process.join()
+                process.close()
+            memory.close()
+            memory.unlink()
+
+    def _fetch_single(self, idx: int, batch_buffer: Batch[np.ndarray], batch_index: int) -> None:
+        episode = next((ep for ep in self._episodes if ep.data_from_index <= idx < ep.data_to_index), None)
         if episode is None:
             raise RuntimeError(f"Index {idx} is out of bounds.")
 
@@ -580,10 +628,10 @@ class Dataloader:
             chunk_index=episode.data_chunk_index,
             file_index=episode.data_file_index,
         )
-        feature_row = {name: values[0] for name, values in _read_row(self._path / feature_file, idx, columns=non_action_features).items()}
-        action_count = min(self._action_horizon, episode.data_to_index - idx)
+        feature_row = {name: values[0] for name, values in _read_row(self._config.path / feature_file, idx, columns=non_action_features).items()}
+        action_count = min(self._config.action_horizon, episode.data_to_index - idx)
         action_rows = _read_row(
-            self._path / feature_file,
+            self._config.path / feature_file,
             idx,
             columns=action_features,
             num_rows=action_count,
@@ -591,7 +639,6 @@ class Dataloader:
 
         if not isinstance(task_id := feature_row.get("task_index"), int):
             raise RuntimeError(f"Expected integral task_id for frame {idx}.")
-        task: str = self._tasks[task_id]
 
         frame_timestamp = feature_row.get("timestamp")
         if isinstance(frame_timestamp, list) and len(frame_timestamp) == 1:
@@ -600,7 +647,7 @@ class Dataloader:
             raise RuntimeError(f"Expected scalar timestamp for frame {idx}.")
         frame_timestamp = float(frame_timestamp)
 
-        self._tokenize_instruction(task, batch_buffer.instruction[batch_index])
+        batch_buffer.instruction[batch_index] = self._task_tokens[task_id]
         batch_buffer.timestamp[batch_index] = frame_timestamp
 
         actions = batch_buffer.action[batch_index]
@@ -609,17 +656,17 @@ class Dataloader:
             feat = feature.name
             if not isinstance(action := action_rows.get(feat), list):
                 raise RuntimeError(f"Failed to load action feature {feat} for frame {idx}.")
-            feature_length = feature.shape[0] if feature.shape else 1
+            feature_length = (feature.shape or (1,))[-1]
             values = np.asarray(action)
             if values.ndim == 1:
                 values = values[:, None]
-            view = actions[:action_count, start_dim : start_dim + feature_length]
+            view = actions[:action_count, ..., start_dim : start_dim + feature_length]
             view[:] = values
             if feature.normalization is not None:
                 feature.normalization.apply(view)
             start_dim += feature_length
-        if action_count < self._action_horizon:
-            match self._padding_type:
+        if action_count < self._config.action_horizon:
+            match self._config.padding_type:
                 case PaddingType.REPEAT_LAST:
                     actions[action_count:] = actions[action_count - 1]
                 case PaddingType.ZERO:
@@ -630,8 +677,8 @@ class Dataloader:
             feat = feature.name
             if (prio := feature_row.get(feat)) is None:
                 raise RuntimeError(f"Failed to load prio feature {feat} for frame {idx}.")
-            feature_length = feature.shape[0] if feature.shape else 1
-            view = batch_buffer.prio[batch_index, start_dim : start_dim + feature_length]
+            feature_length = (feature.shape or (1,))[-1]
+            view = batch_buffer.prio[batch_index, ..., start_dim : start_dim + feature_length]
             view[:] = prio
             if feature.normalization is not None:
                 feature.normalization.apply(view)
@@ -658,19 +705,19 @@ class Dataloader:
                     chunk_index=meta.chunk_idx,
                     file_index=meta.file_idx,
                 )
-                container = self._open_video(self._path / video_file, worker_id)
+                container = self._decoder_cache.open(self._config.path / video_file)
                 source_image = _read_video_frame(container, timestamp)
 
             with source_image as image:
                 image = ImageOps.pad(
                     image.convert("RGB"),
-                    self._resolution,
+                    self._config.resolution,
                     method=Image.Resampling.BILINEAR,
                     color=(0, 0, 0),
                 )
                 view = batch_buffer.observations[batch_index, camera_index]
                 view[:] = np.asarray(image).transpose(2, 0, 1)
                 view /= 255
-                lower, upper = self._observation_range
+                lower, upper = self._config.observation_range
                 view *= upper - lower
                 view += lower
