@@ -12,12 +12,6 @@ rustup component add rustfmt clippy
 uv run pre-commit install
 ```
 
-The default install uses CPU. To include CUDA 13 dependencies for GPU training:
-
-```sh
-uv sync --locked --group cuda
-```
-
 Ruff checks Python errors and import ordering and formats Python code. ty checks
 Python types across the whole project using the locked project environment. The
 pre-commit hooks also check file hygiene, TOML and YAML syntax, and Rust formatting
