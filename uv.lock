@@ -89,6 +89,7 @@ dependencies = [
     { name = "pillow" },
     { name = "pyarrow" },
     { name = "safetensors" },
+    { name = "tqdm" },
 ]
 
 [package.dev-dependencies]
@@ -112,6 +113,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.3.0" },
     { name = "pyarrow", specifier = ">=26.0.0" },
     { name = "safetensors", specifier = ">=0.8.0" },
+    { name = "tqdm", specifier = ">=4.67.3" },
 ]
 
 [package.metadata.requires-dev]
