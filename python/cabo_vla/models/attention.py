@@ -12,7 +12,7 @@ def attention(
 ) -> Float[jax.Array, "Batch T Heads Dim"]:
     # cudnn flash attention for any sequence length. jax's cudnn backward pass rejects odd lengths (197 for the vit),
     # so pad q and kv up to a multiple and pass the true lengths, which makes cudnn mask out the padding
-    if q.dtype not in (jnp.bfloat16, jnp.float16):  # cudnn is half precision only, so f32 (e.g. the hf port test) uses xla
+    if jax.default_backend() != "gpu" or q.dtype not in (jnp.bfloat16, jnp.float16):
         return jax.nn.dot_product_attention(q, k, v, mask=mask)
     B, T = q.shape[:2]
     S = k.shape[1]
