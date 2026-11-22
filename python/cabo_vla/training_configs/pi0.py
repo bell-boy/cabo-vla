@@ -7,10 +7,10 @@ import optax
 from flax import nnx
 from huggingface_hub import snapshot_download
 
-from cabo_vla.config import VLAConfig
 from cabo_vla.data.dataloader import Batch, DataloaderConfig, NormalizationType
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.models.pi0 import VLA
+from cabo_vla.models.pi0.config import VLAConfig
 from cabo_vla.train import TrainConfig, train
 
 
