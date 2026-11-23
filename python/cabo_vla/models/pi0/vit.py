@@ -4,8 +4,8 @@ import jax.numpy as jnp
 from einops import rearrange
 from jaxtyping import Float
 
-from cabo_vla.config import ViTConfig
-from cabo_vla.models.attention import attention
+from cabo_vla.models.common.attention import attention
+from cabo_vla.models.pi0.config import ViTConfig
 
 
 class ViTBlock(nnx.Module):

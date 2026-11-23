@@ -60,7 +60,12 @@ class TrainStepOutput(NamedTuple):
     key: jax.Array
 
 
-def train(config: TrainConfig):
+def train(
+    config: TrainConfig,
+    *,
+    on_step: Callable[[int, float], None] | None = None,
+    on_state: Callable[[int, int, TrainState], None] | None = None,
+):
     key = jax.random.key(config.seed)
     key, _, model_key = jax.random.split(key, 3)
     logging.basicConfig(filename=config.log_file, level=logging.INFO)
@@ -91,6 +96,10 @@ def train(config: TrainConfig):
         key=key,
     )
 
+    step = 0
+    total_steps = len(dataloader) * config.n_epochs
+    if on_state is not None:
+        on_state(step, total_steps, state)
     for epoch in trange(config.n_epochs):
         logger.info(f"Starting epoch {epoch + 1}/{config.n_epochs}")
         for batch in tqdm(dataloader, leave=False):
@@ -110,6 +119,12 @@ def train(config: TrainConfig):
                 dataloader_state=dataloader.get_state(),
                 key=train_output.key,
             )
-            logger.info(f"Loss: {train_output.loss.item()}")
+            loss = train_output.loss.item()
+            logger.info(f"Loss: {loss}")
+            step += 1
+            if on_step is not None:
+                on_step(step, loss)
+            if on_state is not None:
+                on_state(step, total_steps, state)
     logger.info("Training complete.")
     return state

@@ -4,10 +4,10 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-from cabo_vla.config import ViTConfig, VLAConfig
 from cabo_vla.load_model import load_hf_vit
 from cabo_vla.models.pi0 import VLA
-from cabo_vla.models.vit import ViT
+from cabo_vla.models.pi0.config import ViTConfig, VLAConfig
+from cabo_vla.models.pi0.vit import ViT
 
 
 def test_vit():
