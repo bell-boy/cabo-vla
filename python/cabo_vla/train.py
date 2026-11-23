@@ -2,9 +2,7 @@ import functools
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from itertools import islice
 from pathlib import Path
-from time import perf_counter
 from typing import NamedTuple, Protocol
 
 import jax
@@ -65,9 +63,8 @@ class TrainStepOutput(NamedTuple):
 def train(
     config: TrainConfig,
     *,
-    max_steps: int | None = None,
     on_step: Callable[[int, float], None] | None = None,
-    on_step_timing: Callable[[int, float, float], None] | None = None,
+    on_state: Callable[[int, int, TrainState], None] | None = None,
 ):
     key = jax.random.key(config.seed)
     key, _, model_key = jax.random.split(key, 3)
@@ -100,12 +97,12 @@ def train(
     )
 
     step = 0
+    total_steps = len(dataloader) * config.n_epochs
+    if on_state is not None:
+        on_state(step, total_steps, state)
     for epoch in trange(config.n_epochs):
         logger.info(f"Starting epoch {epoch + 1}/{config.n_epochs}")
-        batches = dataloader if max_steps is None else islice(dataloader, max_steps - step)
-        batch_requested = perf_counter()
-        for batch in tqdm(batches, leave=False):
-            batch_ready = perf_counter()
+        for batch in tqdm(dataloader, leave=False):
             train_output = train_step(
                 state.graphdef,
                 state.params,
@@ -114,10 +111,6 @@ def train(
                 batch,
                 state.key,
             )
-            if on_step is not None or on_step_timing is not None:
-                jax.block_until_ready(train_output)
-            if on_step_timing is not None:
-                on_step_timing(step + 1, batch_ready - batch_requested, perf_counter() - batch_ready)
             state = TrainState(
                 graphdef=state.graphdef,
                 params=train_output.params,
@@ -131,8 +124,7 @@ def train(
             step += 1
             if on_step is not None:
                 on_step(step, loss)
-            batch_requested = perf_counter()
-        if step == max_steps:
-            break
+            if on_state is not None:
+                on_state(step, total_steps, state)
     logger.info("Training complete.")
     return state

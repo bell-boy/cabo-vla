@@ -1,9 +1,7 @@
 import json
 import os
 import subprocess
-from datetime import UTC, datetime
 from pathlib import Path
-from statistics import mean
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
@@ -13,13 +11,24 @@ ROOT = Path(__file__).resolve().parent
 DATA = Path("/data")
 VOLUME_NAME = "cabo-vla-q35vla"
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+image_env = {"PYTHONPATH": "/workspace/python", "HF_HOME": str(DATA / "hf"), "JAX_COMPILATION_CACHE_DIR": str(DATA / "jax")}
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_sync(str(ROOT), groups=["dev"])
-    .env({"PYTHONPATH": "/workspace/python", "HF_HOME": str(DATA / "hf"), "JAX_COMPILATION_CACHE_DIR": str(DATA / "jax")})
+    .env(image_env)
+    .add_local_dir(ROOT / "python", "/workspace/python", ignore=["**/__pycache__/**"])
+)
+eval_image = (
+    modal.Image.from_registry("python:3.12-slim-bookworm")
+    .apt_install("libosmesa6", "libgl1", "libglib2.0-0")
+    .uv_sync(str(ROOT), groups=["dev"])
+    .uv_pip_install("torch==2.5.1+cpu", index_url="https://download.pytorch.org/whl/cpu")
+    .uv_pip_install("hf-libero==0.1.5", "torch==2.5.1+cpu", extra_index_url="https://download.pytorch.org/whl/cpu")
+    .env(image_env)
     .add_local_dir(ROOT / "python", "/workspace/python", ignore=["**/__pycache__/**"])
 )
 app = modal.App("cabo-vla-q35vla", image=image)
+wandb_secrets = [modal.Secret.from_local_environ(["WANDB_API_KEY"])] if os.environ.get("WANDB_API_KEY") else []
 
 
 @app.function(volumes={str(DATA): volume}, timeout=1800, cpu=4, memory=8192)
@@ -55,70 +64,175 @@ def training_command(dataset: str, checkpoint: str, output: str, batch_size: int
     ]
 
 
-@app.function(gpu="H100!", volumes={str(DATA): volume}, timeout=24 * 3600, cpu=8, memory=24576)
-def train_on_h100(dataset: str, checkpoint: str, batch_size: int, epochs: int, num_workers: int) -> str:
-    output = DATA / "runs" / uuid4().hex
-    subprocess.run(training_command(dataset, checkpoint, str(output), batch_size, epochs, num_workers), check=True, env={**os.environ, "JAX_PLATFORMS": "cuda"})
+@app.function(image=eval_image, gpu=["L4", "A10"], volumes={str(DATA): volume}, timeout=1800, cpu=4, memory=16384, secrets=wandb_secrets)
+def evaluate_checkpoint(
+    weights: str,
+    dataset: str,
+    checkpoint: str,
+    tasks: int = 5,
+    trials: int = 2,
+    max_steps: int = 220,
+    tracking: dict | None = None,
+    video_dir: str | None = None,
+    temporal_decay: float | None = None,
+) -> dict:
+    volume.reload()
+    with TemporaryDirectory() as scratch:
+        output = Path(scratch) / "results.json"
+        command = [
+            "python",
+            "-u",
+            "-m",
+            "cabo_vla.eval_libero_spatial",
+            weights,
+            "--stats",
+            str(Path(dataset) / "meta" / "stats.json"),
+            "--tokenizer",
+            str(Path(checkpoint) / "tokenizer.json"),
+            "--tasks",
+            str(tasks),
+            "--trials",
+            str(trials),
+            "--max-steps",
+            str(max_steps),
+            "--output",
+            str(output),
+        ]
+        if video_dir:
+            command += ["--video-dir", video_dir]
+        if temporal_decay is not None:
+            command += ["--temporal-decay", str(temporal_decay)]
+        subprocess.run(
+            command,
+            input="n\n",
+            text=True,
+            check=True,
+            env={
+                **os.environ,
+                "JAX_PLATFORMS": "cuda",
+                "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+                "MUJOCO_GL": "osmesa",
+                "PYOPENGL_PLATFORM": "osmesa",
+                "LIBERO_CONFIG_PATH": scratch,
+                "OPENBLAS_NUM_THREADS": "1",
+            },
+        )
+        result = json.loads(output.read_text())
+    if video_dir:
+        (Path(video_dir) / "results.json").write_text(json.dumps(result, indent=2) + "\n")
+        volume.commit()
+    if tracking is not None:
+        import wandb
+
+        Path(weights).with_suffix(".eval.json").write_text(json.dumps(result, indent=2) + "\n")
+        volume.commit()
+        step = tracking["step"]
+        with wandb.init(
+            id=tracking["id"],
+            project=tracking["project"],
+            entity=tracking["entity"],
+            resume="must",
+            settings=wandb.Settings(mode="shared", x_primary=False, x_update_finish_state=False, x_label=f"libero-{step}"),
+        ) as run:
+            run.define_metric("libero_spatial/*", step_metric="checkpoint_step")
+            metrics = {"checkpoint_step": step, "libero_spatial/success_rate": result["success_rate"]}
+            for task in result["tasks"]:
+                metrics[f"libero_spatial/task_{task['task_id']}_success_rate"] = task["successes"] / task["trials"]
+            run.log(metrics)
+    return result
+
+
+@app.function(
+    gpu="H100!",
+    volumes={str(DATA): volume},
+    timeout=24 * 3600,
+    cpu=8,
+    memory=24576,
+    secrets=wandb_secrets,
+)
+def train_on_h100(
+    dataset: str,
+    checkpoint: str,
+    batch_size: int,
+    epochs: int,
+    num_workers: int,
+    wandb_project: str = "",
+    memory_fraction: float = 0.75,
+    run_id: str = "",
+    eval_checkpoints: bool = False,
+    initial_weights: str = "",
+    checkpoint_every_quarter: bool = False,
+    seed: int = 42,
+) -> str:
+    output = DATA / "runs" / (run_id or uuid4().hex)
+    command = training_command(dataset, checkpoint, str(output), batch_size, epochs, num_workers)
+    command += ["--seed", str(seed)]
+    if initial_weights:
+        command += ["--initial-weights", initial_weights]
+    if checkpoint_every_quarter:
+        command += ["--checkpoint-every-quarter"]
+    if wandb_project:
+        command += ["--wandb-project", wandb_project]
+    if eval_checkpoints:
+        command += ["--eval-checkpoints"]
+    print(f"Training output: {output.relative_to(DATA)}", flush=True)
+    env = {**os.environ, "JAX_PLATFORMS": "cuda", "XLA_CLIENT_MEM_FRACTION": str(memory_fraction)}
+    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True, env=env) as process:
+        try:
+            assert process.stdout is not None
+            for line in process.stdout:
+                print(line, end="", flush=True)
+                if line.startswith("Checkpoint saved: "):
+                    volume.commit()
+                    print("Checkpoint committed to Modal Volume", flush=True)
+                if line.startswith("Checkpoint evaluation: "):
+                    request = json.loads(line.removeprefix("Checkpoint evaluation: "))
+                    try:
+                        call = evaluate_checkpoint.spawn(request["weights"], dataset, checkpoint, tracking=request)
+                        print(f"LIBERO evaluation queued at step {request['step']}: {call.object_id}", flush=True)
+                    except Exception as error:
+                        print(f"Could not queue LIBERO evaluation at step {request['step']}: {error}", flush=True)
+            if return_code := process.wait():
+                raise subprocess.CalledProcessError(return_code, command)
+        finally:
+            if process.poll() is None:
+                process.terminate()
     volume.commit()
     return str(output.relative_to(DATA))
 
 
-def gpu_activity(samples: Path, start: float, end: float) -> dict:
-    readings = []
-    for line in samples.read_text().splitlines():
-        stamp, _, utilization = line.partition(", ")
-        if utilization.isdigit():
-            timestamp = datetime.strptime(stamp, "%Y/%m/%d %H:%M:%S.%f").replace(tzinfo=UTC).timestamp()
-            if start <= timestamp <= end:
-                readings.append(int(utilization))
-    return {"gpu_utilization_percent": mean(readings) if readings else None, "gpu_samples": len(readings)}
-
-
-@app.function(gpu="H100!", volumes={str(DATA): volume}, timeout=7200, cpu=8, memory=24576)
-def sweep_on_h100(dataset: str, checkpoint: str, batch_sizes: list[int], steps: int, warmup_steps: int, num_workers: int) -> dict:
-    gpu = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader"], text=True).strip()
-    print(f"Benchmark GPU: {gpu}", flush=True)
-    results = []
-    with TemporaryDirectory() as scratch:
-        for batch_size in batch_sizes:
-            print(f"Sweeping batch size {batch_size}", flush=True)
-            output = Path(scratch) / str(batch_size)
-            command = training_command(dataset, checkpoint, str(output), batch_size, 1, num_workers)
-            command += ["--benchmark-steps", str(steps), "--warmup-steps", str(warmup_steps)]
-            samples = output.with_suffix(".csv")
-            query = ["nvidia-smi", "--query-gpu=timestamp,utilization.gpu", "--format=csv,noheader,nounits", "-lms", "200"]
-            with samples.open("w") as stream, subprocess.Popen(query, stdout=stream, env={**os.environ, "TZ": "UTC"}) as monitor:
-                try:
-                    result = subprocess.run(command, stderr=subprocess.PIPE, text=True, env={**os.environ, "JAX_PLATFORMS": "cuda"})
-                finally:
-                    monitor.terminate()
-            if result.returncode == 0:
-                metrics = json.loads((output / "throughput.json").read_text())
-                metrics.update(gpu_activity(samples, metrics["window_start_unix"], metrics["window_end_unix"]))
-                results.append(metrics)
-            elif "RESOURCE_EXHAUSTED" in result.stderr or "CUDA_ERROR_OUT_OF_MEMORY" in result.stderr:
-                print(f"Batch size {batch_size} ran out of GPU memory", flush=True)
-                results.append({"batch_size": batch_size, "status": "out_of_memory"})
-            else:
-                raise RuntimeError(f"Batch size {batch_size} failed with exit code {result.returncode}:\n{result.stderr[-6000:]}")
-    return {"gpu": gpu, "num_workers": num_workers, "results": results}
-
-
 @app.local_entrypoint()
 def main(
-    batch_sizes: str = "1,2,4,8,16",
-    steps: int = 20,
-    warmup_steps: int = 5,
     num_workers: int = 4,
-    epochs: int = 0,
+    epochs: int = 1,
     batch_size: int = 1,
+    wandb_project: str = "",
+    memory_fraction: float = 0.75,
+    eval_checkpoints: bool = False,
+    initial_weights: str = "",
+    checkpoint_every_quarter: bool = False,
+    seed: int = 42,
 ):
-    sizes = sorted({int(value) for value in batch_sizes.split(",")})
-    if min(*sizes, steps, warmup_steps, num_workers, batch_size) < 1 or epochs < 0:
-        raise ValueError("Batch sizes, steps, and workers must be positive. Epochs must be nonnegative.")
+    if min(epochs, num_workers, batch_size) < 1:
+        raise ValueError("Epochs, batch size, and worker count must be positive.")
+    if not 0 < memory_fraction <= 1:
+        raise ValueError("Memory fraction must be in (0, 1].")
+    if wandb_project and not os.environ.get("WANDB_API_KEY"):
+        raise ValueError("W&B logging requires WANDB_API_KEY in the local environment.")
+    if eval_checkpoints and not wandb_project:
+        raise ValueError("Checkpoint evaluation requires --wandb-project.")
     dataset, checkpoint = prepare_inputs.remote()
-    if epochs:
-        output = train_on_h100.remote(dataset, checkpoint, batch_size, epochs, num_workers)
-        print(f"Weights and log saved to Modal Volume {VOLUME_NAME} at {output}")
-    else:
-        print(json.dumps(sweep_on_h100.remote(dataset, checkpoint, sizes, steps, warmup_steps, num_workers), indent=2))
+    output = train_on_h100.remote(
+        dataset,
+        checkpoint,
+        batch_size,
+        epochs,
+        num_workers,
+        wandb_project,
+        memory_fraction,
+        eval_checkpoints=eval_checkpoints,
+        initial_weights=initial_weights,
+        checkpoint_every_quarter=checkpoint_every_quarter,
+        seed=seed,
+    )
+    print(f"Weights and log saved to Modal Volume {VOLUME_NAME} at {output}")

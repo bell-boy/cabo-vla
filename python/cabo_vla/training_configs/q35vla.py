@@ -1,15 +1,15 @@
 import argparse
 import json
 from dataclasses import asdict, fields
-from math import isfinite
+from math import ceil
 from pathlib import Path
-from time import perf_counter, time
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import nnx
 from huggingface_hub import snapshot_download
+from safetensors import safe_open
 from safetensors.flax import save_file
 from tokenizers import Tokenizer
 
@@ -17,7 +17,7 @@ from cabo_vla.data.dataloader import Batch, DataloaderConfig, NormalizationType
 from cabo_vla.load_model import load_hf_qwen35
 from cabo_vla.models.qwen35vla.qwen35 import Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig
 from cabo_vla.models.qwen35vla.qwen35vla import Qwen3_5VLA, Qwen3_5VLAConfig
-from cabo_vla.train import TrainConfig, train
+from cabo_vla.train import TrainConfig, TrainState, train
 
 DATASET_REPO = "lerobot/libero"
 BACKBONE_REPO = "Qwen/Qwen3.5-0.8B"
@@ -49,13 +49,43 @@ def load_config(checkpoint: Path, pad_token_id: int) -> Qwen3_5VLAConfig:
     )
 
 
-def create_model(cfg: Qwen3_5VLAConfig, checkpoint: Path, *, rngs: nnx.Rngs) -> Qwen3_5VLA:
-    backbone = load_hf_qwen35(cfg.qwen_config, checkpoint)
+def create_model(cfg: Qwen3_5VLAConfig, checkpoint: Path | None, *, rngs: nnx.Rngs, initial_weights: Path | None = None) -> Qwen3_5VLA:
+    if initial_weights is not None:
+        loaded_config, model = load_vla_checkpoint(initial_weights)
+        if loaded_config != cfg:
+            raise ValueError("The VLA checkpoint configuration does not match the training configuration")
+        return model
+
+    backbone = load_hf_qwen35(cfg.qwen_config, checkpoint) if checkpoint is not None else None
     model = Qwen3_5VLA(cfg, rngs, backbone=backbone)
     for _, module in nnx.iter_modules(model):
         if isinstance(module, (nnx.Linear, nnx.Conv, nnx.Embed, nnx.LayerNorm, nnx.RMSNorm)):
             module.dtype = jnp.bfloat16
     return model
+
+
+def load_vla_checkpoint(checkpoint: Path) -> tuple[Qwen3_5VLAConfig, Qwen3_5VLA]:
+    with safe_open(checkpoint, framework="flax") as weights:
+        config = json.loads((weights.metadata() or {})["vla_config"])
+        backbone = config.pop("qwen_config")
+        text = backbone.pop("text_config")
+        text["mrope_section"] = tuple(text["mrope_section"])
+        vision = backbone.pop("vision_config")
+        config["observation_range"] = tuple(config["observation_range"])
+        cfg = Qwen3_5VLAConfig(
+            qwen_config=Qwen3_5Config(Qwen3_5TextConfig(**text), Qwen3_5VisionConfig(**vision), **backbone),
+            **config,
+        )
+        abstract = nnx.eval_shape(lambda: create_model(cfg, None, rngs=nnx.Rngs(0)))
+        graph, params = nnx.split(abstract)
+        loaded = []
+        for path, param in params.flat_state():
+            name = ".".join(map(str, path))
+            value = weights.get_tensor(name)
+            if value.shape != param.shape:
+                raise ValueError(f"{name}: checkpoint shape {value.shape} differs from expected {param.shape}")
+            loaded.append((path, param.replace(value=value)))
+    return cfg, nnx.merge(graph, nnx.State.from_flat_path(loaded))
 
 
 def loss_fn(
@@ -80,17 +110,21 @@ def main():
     parser = argparse.ArgumentParser(description="Fine-tune Qwen3.5 VLA on LeRobot LIBERO.")
     parser.add_argument("--dataset", type=Path, help="Local LeRobot LIBERO dataset directory")
     parser.add_argument("--checkpoint", type=Path, help="Local Qwen3.5-0.8B Hugging Face snapshot")
+    parser.add_argument("--initial-weights", type=Path, help="Warm-start from a Cabo VLA safetensors checkpoint")
+    parser.add_argument("--checkpoint-every-quarter", action="store_true", help="Save weights at each quarter of every epoch")
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, default=Path("runs/q35vla"))
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--benchmark-steps", type=int, help="Measure training throughput for this many optimizer steps")
-    parser.add_argument("--warmup-steps", type=int, default=5, help="Exclude this many initial steps from benchmark timing")
+    parser.add_argument("--eval-checkpoints", action="store_true", help="Queue Spatial rollouts through the Modal launcher")
+    parser.add_argument("--wandb-project", help="Log training loss to this Weights & Biases project")
     args = parser.parse_args()
-    if min(args.epochs, args.batch_size, args.num_workers, args.warmup_steps) < 1:
-        parser.error("Epochs, batch size, worker count, and warmup steps must be positive")
-    if args.benchmark_steps is not None and args.benchmark_steps < 1:
-        parser.error("--benchmark-steps must be positive")
+    if min(args.epochs, args.batch_size, args.num_workers) < 1:
+        parser.error("Epochs, batch size, and worker count must be positive")
+
+    if args.eval_checkpoints and not args.wandb_project:
+        parser.error("--eval-checkpoints requires --wandb-project")
 
     args.output.mkdir(parents=True, exist_ok=True)
     log_file = args.output / "train.log"
@@ -127,70 +161,89 @@ def main():
             seq_len=64,
             pad_token_id=pad_token_id,
             observation_range=vla_config.observation_range,
-            seed=42,
+            seed=args.seed,
             num_workers=args.num_workers,
         ),
         log_file=log_file,
         model_type=create_model,
-        model_kwargs={"cfg": vla_config, "checkpoint": checkpoint},
+        model_kwargs={"cfg": vla_config, "checkpoint": checkpoint, "initial_weights": args.initial_weights},
         optimizer=optax.adamw(learning_rate=1e-5),
         loss_fn=loss_fn,
-        seed=42,
+        seed=args.seed,
         n_epochs=args.epochs,
     )
-    if args.benchmark_steps is not None:
-        target_steps = args.warmup_steps + args.benchmark_steps
-        started = elapsed = 0.0
-        final_loss = 0.0
-        window_start = window_end = 0.0
-        batch_wait = optimizer_time = 0.0
+    checkpoint_names: dict[int, str] = {}
 
-        def record_timing(step: int, wait: float, compute: float):
-            nonlocal batch_wait, optimizer_time
-            if step > args.warmup_steps:
-                batch_wait += wait
-                optimizer_time += compute
+    def save_checkpoint(step: int, total_steps: int, state: TrainState):
+        if step == 0:
+            if args.checkpoint_every_quarter:
+                per_epoch = total_steps // args.epochs
+                for epoch in range(args.epochs):
+                    for quarter in range(1, 5):
+                        milestone = epoch * per_epoch + (per_epoch * quarter + 3) // 4
+                        checkpoint_names[milestone] = f"model-epoch-{epoch + 1:02d}-{quarter * 25:03d}pct.safetensors"
+                checkpoint_names[total_steps] = model_file.name
+            else:
+                checkpoint_names.update(
+                    {
+                        0: "model-start.safetensors",
+                        ceil(total_steps / 2): "model-half.safetensors",
+                        ceil(total_steps * 3 / 4): "model-75pct.safetensors",
+                        total_steps: model_file.name,
+                    }
+                )
+        filename = checkpoint_names.get(step)
+        if filename is None:
+            return
+        destination = args.output / filename
+        weights = {".".join(map(str, path)): param[...] for path, param in state.params.flat_state()}
+        temporary_file = destination.with_suffix(".tmp")
+        save_file(weights, temporary_file, metadata={"vla_config": json.dumps(asdict(vla_config)), "step": str(step), "total_steps": str(total_steps)})
+        temporary_file.replace(destination)
+        print(f"Checkpoint saved: {destination}", flush=True)
+        return destination
 
-        def record_step(step: int, loss: float):
-            nonlocal started, elapsed, final_loss, window_start, window_end
-            if not isfinite(loss):
-                raise RuntimeError(f"Non-finite training loss at step {step}: {loss}")
-            if step == args.warmup_steps:
-                started = perf_counter()
-                window_start = time()
-            if step == target_steps:
-                window_end = time()
-                elapsed = perf_counter() - started
-                final_loss = loss
+    if args.wandb_project:
+        import wandb
 
-        train(config, max_steps=target_steps, on_step=record_step, on_step_timing=record_timing)
-        if elapsed <= 0:
-            raise RuntimeError(f"Training ended before {target_steps} benchmark steps completed")
-        result = {
-            "peak_bytes_in_use": (jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use"),
-            "device": jax.devices()[0].device_kind,
-            "batch_size": args.batch_size,
-            "warmup_steps": args.warmup_steps,
-            "measured_steps": args.benchmark_steps,
-            "elapsed_seconds": elapsed,
-            "window_start_unix": window_start,
-            "window_end_unix": window_end,
-            "dataloader_workers": min(args.num_workers, args.batch_size),
-            "batch_wait_seconds": batch_wait,
-            "optimizer_seconds": optimizer_time,
-            "steps_per_second": args.benchmark_steps / elapsed,
-            "examples_per_second": args.batch_size * args.benchmark_steps / elapsed,
-            "final_loss": final_loss,
-        }
-        (args.output / "throughput.json").write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps(result), flush=True)
-        return None
+        with wandb.init(
+            project=args.wandb_project,
+            name=args.output.name,
+            dir=str(args.output),
+            settings=wandb.Settings(mode="shared", x_label="trainer") if args.eval_checkpoints else None,
+            config={
+                "backbone": BACKBONE_REPO,
+                "checkpoint_revision": checkpoint.name,
+                "initial_weights": str(args.initial_weights) if args.initial_weights is not None else None,
+                "checkpoint_every_quarter": args.checkpoint_every_quarter,
+                "dataset": DATASET_REPO,
+                "dataset_revision": dataset.name,
+                "batch_size": args.batch_size,
+                "epochs": args.epochs,
+                "dataloader_workers": min(args.num_workers, args.batch_size),
+                "learning_rate": 1e-5,
+                "seed": config.seed,
+            },
+        ) as run:
+            print(f"W&B run: {run.url}", flush=True)
 
-    state = train(config)
-    weights = {".".join(map(str, path)): param[...] for path, param in state.params.flat_state()}
-    temporary_file = model_file.with_suffix(".tmp")
-    save_file(weights, temporary_file, metadata={"vla_config": json.dumps(asdict(vla_config))})
-    temporary_file.replace(model_file)
+            def checkpoint_and_queue_eval(step: int, total_steps: int, state: TrainState):
+                weights = save_checkpoint(step, total_steps, state)
+                if weights is not None and args.eval_checkpoints:
+                    request = {"weights": str(weights), "step": step, "id": run.id, "project": run.project, "entity": run.entity}
+                    print(f"Checkpoint evaluation: {json.dumps(request)}", flush=True)
+
+            def log_loss(step: int, loss: float):
+                if args.eval_checkpoints:
+                    run.log({"train/step": step, "train/loss": loss})
+                else:
+                    run.log({"train/loss": loss}, step=step)
+
+            if args.eval_checkpoints:
+                run.define_metric("train/loss", step_metric="train/step")
+            state = train(config, on_step=log_loss, on_state=checkpoint_and_queue_eval)
+    else:
+        state = train(config, on_state=save_checkpoint)
     return state
 
 

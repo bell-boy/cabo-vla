@@ -18,6 +18,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "tokenizers>=0.22",
     "tqdm>=4.67.3",
+    "wandb>=0.31.2",
 ]
 
 [build-system]
