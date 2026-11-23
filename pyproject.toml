@@ -16,6 +16,7 @@ dependencies = [
     "pillow>=12.3.0",
     "pyarrow>=26.0.0",
     "safetensors>=0.8.0",
+    "tokenizers>=0.22",
     "tqdm>=4.67.3",
 ]
 
@@ -45,6 +46,7 @@ ignore = ["F722"]
 
 [dependency-groups]
 dev = [
+    "modal==1.6.4",
     "pre-commit>=4.6.2",
     "pytest>=9.1.1",
     "ruff>=0.16.10",

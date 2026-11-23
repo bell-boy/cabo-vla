@@ -1,6 +1,14 @@
+import json
+from collections import defaultdict
+from pathlib import Path
+
 import jax.numpy as jnp
+from flax import nnx
 from huggingface_hub import hf_hub_download
+from safetensors import safe_open
 from safetensors.numpy import load_file
+
+from cabo_vla.models.qwen35vla.qwen35 import Qwen3_5Config, Qwen3_5Model
 
 
 def load_hf_vit(model, repo="google/vit-base-patch16-224"):
@@ -51,3 +59,55 @@ def load_hf_vit(model, repo="google/vit-base-patch16-224"):
     # classifier is optional (skip it for the VLA)
     if model.projector_mlp is not None:
         linear(model.projector_mlp, "classifier")
+
+
+def _qwen35_weight_name(path: tuple[object, ...]) -> str:
+    *module, parameter = map(str, path)
+    name = ".".join(module)
+    if name == "visual.patch_embed":
+        name += ".proj"
+    elif name.startswith("visual.blocks."):
+        prefix, layer = name.rsplit(".", 1)
+        if layer in ("qkv", "proj"):
+            name = f"{prefix}.attn.{layer}"
+        elif layer in ("linear_fc1", "linear_fc2"):
+            name = f"{prefix}.mlp.{layer}"
+    elif name.startswith("visual.merger_"):
+        layer = name.removeprefix("visual.merger_")
+        name = f"visual.merger.{layer if layer == 'norm' else 'linear_' + layer}"
+    if parameter in ("kernel", "embedding", "scale"):
+        parameter = "weight"
+    return f"model.{name}.{parameter}"
+
+
+def load_hf_qwen35(config: Qwen3_5Config, checkpoint: Path) -> Qwen3_5Model:
+    abstract_model = nnx.eval_shape(lambda: Qwen3_5Model(config, nnx.Rngs(0)))
+    graphdef, state = nnx.split(abstract_model)
+    params = {_qwen35_weight_name(path): (path, param) for path, param in state.flat_state()}
+
+    index = checkpoint / "model.safetensors.index.json"
+    if index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+    else:
+        with safe_open(checkpoint / "model.safetensors", framework="flax") as weights:
+            weight_map = dict.fromkeys(weights.keys(), "model.safetensors")
+
+    by_shard = defaultdict(list)
+    for name in params:
+        by_shard[weight_map[name]].append(name)
+
+    loaded = {}
+    for shard, names in by_shard.items():
+        with safe_open(checkpoint / shard, framework="flax") as weights:
+            for name in names:
+                path, param = params[name]
+                value = weights.get_tensor(name)
+                if path[-1] == "kernel":
+                    # PyTorch stores output channels first. Flax stores them last.
+                    axes = (*range(2, value.ndim), 1, 0)
+                    value = value.transpose(axes)
+                if value.shape != param.shape:
+                    raise ValueError(f"{name}: checkpoint shape {value.shape} does not match model shape {param.shape}")
+                loaded[path] = param.replace(value=jnp.asarray(value, dtype=param.dtype))
+
+    return nnx.merge(graphdef, nnx.State.from_flat_path(loaded))

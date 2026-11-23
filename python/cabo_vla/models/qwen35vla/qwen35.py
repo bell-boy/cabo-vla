@@ -156,6 +156,76 @@ class Qwen3_5Attention(nnx.Module):
         return self.o_proj(out), (k, v)
 
 
+def _scan_gated_delta(state, q, k, v, beta, log_decay):
+    def step(state, inputs):
+        q, k, v, beta, decay = inputs
+        state = state * decay[..., None, None]
+        prediction = jnp.einsum("bhkv,bhk->bhv", state, k)
+        delta = (v - prediction) * beta[..., None]
+        state = state + k[..., None] * delta[..., None, :]
+        return state, jnp.einsum("bhkv,bhk->bhv", state, q)
+
+    inputs = (q, k, v.astype(jnp.float32), beta, jnp.exp(log_decay))
+    state, out = jax.lax.scan(step, state, tuple(jnp.swapaxes(y, 0, 1) for y in inputs))
+    return state, jnp.swapaxes(out, 0, 1)
+
+
+def _delta_chunk(state, inputs):
+    q, k, v, beta, log_decay = (x.astype(jnp.float32) for x in inputs)
+    # Each row is a token. Entry (i,j) discounts token j's update through token i.
+    prefix = jnp.cumsum(log_decay, axis=-1)
+    causal = jnp.tri(q.shape[-2], dtype=bool)
+    weights = jnp.exp(jnp.where(causal, prefix[..., :, None] - prefix[..., None, :], -jnp.inf))
+    incoming = jnp.exp(prefix)[..., None]
+    kt = k.swapaxes(-2, -1)
+    with jax.default_matmul_precision("highest"):
+        # Delta_i depends on all strictly earlier deltas via the decayed key Gram matrix.
+        lower = jnp.tril((k @ kt) * weights * beta[..., None], -1)
+        rhs = beta[..., None] * (v - incoming * (k @ state))
+        delta = jax.lax.linalg.triangular_solve(lower, rhs, left_side=True, lower=True, unit_diagonal=True)
+        out = incoming * (q @ state) + ((q @ kt) * weights) @ delta
+        state = incoming[..., -1:, :] * state + kt @ (weights[..., -1, :, None] * delta)
+    return state, out
+
+
+@jax.custom_vjp
+def _delta_chunks(state, inputs):
+    return jax.lax.scan(_delta_chunk, state, inputs)
+
+
+def _delta_chunks_fwd(state, inputs):
+    return _delta_chunks(state, inputs), (state, inputs)
+
+
+def _delta_chunks_bwd(residual, cotangent):
+    state, inputs = residual
+
+    # Replay the chunk scan to recover its boundary states, then rematerialize
+    # the triangular solve one chunk at a time in the transposed scan.
+    def replay(state, inputs):
+        return jax.lax.scan(jax.checkpoint(_delta_chunk, prevent_cse=False), state, inputs)
+
+    _, pullback = jax.vjp(replay, state, inputs)
+    return pullback(cotangent)
+
+
+_delta_chunks.defvjp(_delta_chunks_fwd, _delta_chunks_bwd)
+
+
+def _chunk_gated_delta(state, q, k, v, beta, log_decay):
+    length = q.shape[1]
+    size = 64
+
+    def chunks(x):
+        padding = [(0, 0)] * x.ndim
+        padding[1] = (0, -length % size)
+        # Zero log decay and zero updates leave the tail state unchanged.
+        return rearrange(jnp.pad(x, padding), "b (n t) h ... -> n b h t ...", t=size)
+
+    state, out = _delta_chunks(state, tuple(chunks(x) for x in (q, k, v, beta, log_decay)))
+    return state, rearrange(out, "n b h t d -> b (n t) h d")[:, :length]
+
+
 class Qwen3_5GatedDeltaNet(nnx.Module):
     def __init__(self, config: Qwen3_5TextConfig, *, rngs: nnx.Rngs):
         if config.linear_num_value_heads % config.linear_num_key_heads:
@@ -215,18 +285,9 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         beta = jax.nn.sigmoid(self.in_proj_b(x)).astype(jnp.float32)
         rate = jnp.exp(self.A_log[...].astype(jnp.float32))
         dt = jax.nn.softplus(self.in_proj_a(x).astype(jnp.float32) + self.dt_bias[...])
-        decay = jnp.exp(-rate * dt)
-
-        def step(state, inputs):
-            q, k, v, beta, decay = inputs
-            state = state * decay[..., None, None]
-            prediction = jnp.einsum("bhkv,bhk->bhv", state, k)
-            delta = (v - prediction) * beta[..., None]
-            state = state + k[..., None] * delta[..., None, :]
-            return state, jnp.einsum("bhkv,bhk->bhv", state, q)
-
-        state, out = jax.lax.scan(step, state, tuple(jnp.swapaxes(y, 0, 1) for y in (q, k, v.astype(jnp.float32), beta, decay)))
-        out = jnp.swapaxes(out, 0, 1).astype(v.dtype)
+        rule = _chunk_gated_delta if cache is None else _scan_gated_delta
+        state, out = rule(state, q, k, v, beta, -rate * dt)
+        out = out.astype(v.dtype)
         gate = rearrange(self.in_proj_z(x), "b t (h d) -> b t h d", d=self.head_v_dim)
         out = (self.norm(out).astype(out.dtype) * jax.nn.silu(gate.astype(jnp.float32))).astype(out.dtype)
         return self.out_proj(rearrange(out, "b t h d -> b t (h d)")), (history, state)

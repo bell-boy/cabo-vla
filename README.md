@@ -39,6 +39,30 @@ The `Tests` workflow runs the Python test suite on CPU with Python 3.12 and the
 locked uv dependencies, plus Rust tests on the stable toolchain. It runs on pull
 requests, pushes to `main`, merge queue updates, and manual dispatches.
 
+## Qwen3.5 VLA on Modal
+
+With a configured Modal profile, run the LIBERO batch-size sweep:
+
+```sh
+uvx --from modal==1.6.4 modal run modal_q35vla.py --batch-sizes 1,2,4,8,16
+```
+
+The sweep uses one H100 and reports completed optimizer steps and examples per second,
+including data loading. It also reports batch wait time, synchronized optimizer time,
+and mean GPU utilization sampled during the measurement window. Each batch size runs
+in a fresh process with five warmup steps and twenty measured steps by default.
+Training uses chunked Gated DeltaNet and four dataloader workers by default, capped
+at the batch size. Set `--num-workers` to compare worker counts.
+
+To fine-tune for an epoch and save the model weights and training log:
+
+```sh
+uvx --from modal==1.6.4 modal run modal_q35vla.py --epochs 1 --batch-size 8
+```
+
+Modal caches the Hugging Face inputs and stores training runs in the
+`cabo-vla-q35vla` volume. The training command prints the output directory.
+
 ## todo
 
 The goal right now is building an MVP:

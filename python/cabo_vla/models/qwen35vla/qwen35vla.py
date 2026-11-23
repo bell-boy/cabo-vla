@@ -136,34 +136,6 @@ class Qwen3_5VLA(nnx.Module):
         self.observation_range = config.observation_range
         self.pad_token_id = config.pad_token_id
 
-    def encode_prefix(
-        self,
-        input_ids: jax.Array,
-        *,
-        state: jax.Array | None = None,
-        attention_mask: jax.Array | None = None,
-        pixel_values: jax.Array | None = None,
-        image_grid_thw: VisionGrids = (),
-        pixel_values_videos: jax.Array | None = None,
-        video_grid_thw: VisionGrids = (),
-    ) -> Qwen3_5VLAActionCache:
-        context, _ = self.backbone(
-            input_ids,
-            attention_mask=attention_mask,
-            pixel_values=pixel_values,
-            image_grid_thw=image_grid_thw,
-            pixel_values_videos=pixel_values_videos,
-            video_grid_thw=video_grid_thw,
-        )
-        mask = jnp.ones_like(input_ids, dtype=jnp.bool_) if attention_mask is None else attention_mask.astype(jnp.bool_)
-        if state is not None:
-            if state.shape != (input_ids.shape[0], self.state_size):
-                raise ValueError("state must have shape [batch, state_size]")
-            state_token = self.state_proj(state).astype(context.dtype)[:, None, :]
-            context = jnp.concatenate((context, state_token), axis=1)
-            mask = jnp.pad(mask, ((0, 0), (0, 1)), constant_values=True)
-        return self.action_head.encode_context(context, mask)
-
     def encode_batch(self, batch: Batch[jax.Array]) -> Qwen3_5VLAActionCache:
         batch_size, cameras, channels, height, width = batch.observations.shape
         input_ids = batch.instruction
@@ -194,13 +166,19 @@ class Qwen3_5VLA(nnx.Module):
         if input_ids.shape[1] == 0:
             input_ids = jnp.zeros((batch_size, 1), dtype=jnp.int32)
             mask = jnp.zeros_like(input_ids, dtype=jnp.bool_)
-        return self.encode_prefix(
+        context, _ = self.backbone(
             input_ids,
-            state=state if state.shape[1] else None,
             attention_mask=mask,
             pixel_values=pixel_values,
             image_grid_thw=grids,
         )
+        if state.shape[1]:
+            if state.shape != (input_ids.shape[0], self.state_size):
+                raise ValueError("state must have shape [batch, state_size]")
+            state_token = self.state_proj(state).astype(context.dtype)[:, None, :]
+            context = jnp.concatenate((context, state_token), axis=1)
+            mask = jnp.pad(mask, ((0, 0), (0, 1)), constant_values=True)
+        return self.action_head.encode_context(context, mask)
 
     def run_action_head(
         self,
